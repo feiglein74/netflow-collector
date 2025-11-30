@@ -4,6 +4,49 @@ Alle wesentlichen Änderungen an diesem Projekt werden in dieser Datei dokumenti
 
 Das Format basiert auf [Keep a Changelog](https://keepachangelog.com/de/1.0.0/).
 
+## [0.2.0] - 2025-11-30
+
+### Hinzugefügt
+
+- **Interface Statistics (F2)**
+  - Neue Seite mit Statistiken pro Interface
+  - Subnet-Erkennung aus privaten IPs (10.x, 172.16-31.x, 192.168.x)
+  - IPv6 Support für ULA (fd00::/8) und Link-Local (fe80::/10)
+  - Zwei-Zeilen-Anzeige wenn IPv6 vorhanden
+  - Separate Spalten für interne (Int) und externe (Ext) IPs
+
+- **IP Detail View**
+  - Modal mit allen IPs eines Interface (Enter auf Interface)
+  - Live-Updates während Modal geöffnet
+  - Space zum Markieren, Enter zum Filtern
+  - DNS-Auflösung für alle IPs mit Cache-Lookup
+  - Typ-Anzeige (int/ext) mit Farbcodierung
+  - Sortierung: Private IPs zuerst, dann Public
+
+- **Hybrid Eviction System**
+  - TopK-Protection für "Elephant Flows" (größte Flows nach Bytes)
+  - LRU-Protection für kürzlich angesehene Flows
+  - FIFO-Fallback für normale Flows
+  - Neue CLI-Flags: `-topk-percent`, `-lru-window`
+  - Eviction-Statistiken in TUI und beim Beenden
+
+- **Filter-Erweiterungen**
+  - Interface-Filter: `if=`, `inif=`, `outif=`
+  - CIDR-Notation: `host=192.168.0.0/24`
+
+- **UI Verbesserungen**
+  - Custom Autocomplete-Dropdown (ersetzt tview built-in)
+  - Pfeiltasten-Navigation durch Vorschläge
+  - Tab/Enter akzeptiert Auswahl, Esc schließt
+  - Dropdown überlagert Tabelle statt sie zu verschieben
+  - Locale-aware Zahlenformatierung (Deutsch: 1.234,5)
+
+### Geändert
+
+- Flow Detail View markiert Flow als "accessed" für LRU-Protection
+- Interface Table hat jetzt Int/Ext Spalten statt nur IPs-Spalte
+- max-flows Default korrigiert auf 100.000
+
 ## [0.1.0] - 2025-11-29
 
 ### Hinzugefügt

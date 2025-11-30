@@ -30,23 +30,24 @@ func (v FlowVersion) String() string {
 
 // Flow represents a single network flow record
 type Flow struct {
-	Version    FlowVersion
-	SrcAddr    net.IP
-	DstAddr    net.IP
-	SrcPort    uint16
-	DstPort    uint16
-	Protocol   uint8
-	Bytes      uint64
-	Packets    uint64
-	StartTime  time.Time
-	EndTime    time.Time
-	TCPFlags   uint8
-	SrcAS      uint32
-	DstAS      uint32
-	InputIf    uint16
-	OutputIf   uint16
-	ExporterIP net.IP
-	ReceivedAt time.Time
+	Version      FlowVersion
+	SrcAddr      net.IP
+	DstAddr      net.IP
+	SrcPort      uint16
+	DstPort      uint16
+	Protocol     uint8
+	Bytes        uint64
+	Packets      uint64
+	StartTime    time.Time
+	EndTime      time.Time
+	TCPFlags     uint8
+	SrcAS        uint32
+	DstAS        uint32
+	InputIf      uint16
+	OutputIf     uint16
+	ExporterIP   net.IP
+	ReceivedAt   time.Time
+	LastAccessed time.Time // LRU tracking - when flow was last viewed/queried
 }
 
 // ProtocolName returns the human-readable protocol name

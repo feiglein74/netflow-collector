@@ -574,6 +574,20 @@ type Stats struct {
 	UniqueExporters int
 }
 
+// EvictionConfig configures the hybrid eviction strategy
+type EvictionConfig struct {
+	TopKPercent float64       // Percent of max-flows to protect as elephant flows (e.g., 1.0 = 1%)
+	LRUWindow   time.Duration // Protect flows accessed within this window
+}
+
+// DefaultEvictionConfig returns sensible defaults
+func DefaultEvictionConfig() EvictionConfig {
+	return EvictionConfig{
+		TopKPercent: 1.0,               // Keep top 1% as elephant flows
+		LRUWindow:   5 * time.Minute,   // Keep recently viewed flows for 5 min
+	}
+}
+
 // FlowStore stores flows in memory
 type FlowStore struct {
 	mu              sync.RWMutex
@@ -584,10 +598,25 @@ type FlowStore struct {
 	lastStatsUpdate time.Time
 	flowsInWindow   int
 	bytesInWindow   uint64
+	evictionConfig  EvictionConfig
+	evictionStats   EvictionStats
+}
+
+// EvictionStats tracks eviction statistics
+type EvictionStats struct {
+	TotalEvicted   uint64
+	FIFOEvicted    uint64
+	TopKProtected  int
+	LRUProtected   int
 }
 
 // New creates a new flow store
 func New(maxFlows int) *FlowStore {
+	return NewWithConfig(maxFlows, DefaultEvictionConfig())
+}
+
+// NewWithConfig creates a new flow store with custom eviction config
+func NewWithConfig(maxFlows int, evictionConfig EvictionConfig) *FlowStore {
 	if maxFlows == 0 {
 		maxFlows = 100000
 	}
@@ -597,6 +626,7 @@ func New(maxFlows int) *FlowStore {
 		maxFlows:        maxFlows,
 		exporters:       make(map[string]bool),
 		lastStatsUpdate: time.Now(),
+		evictionConfig:  evictionConfig,
 	}
 
 	return fs
@@ -635,9 +665,9 @@ func (fs *FlowStore) Add(flows []types.Flow) {
 		fs.flows = append(fs.flows, flow)
 	}
 
-	// Trim if over max
+	// Hybrid eviction if over max
 	if len(fs.flows) > fs.maxFlows {
-		fs.flows = fs.flows[len(fs.flows)-fs.maxFlows:]
+		fs.evictFlows()
 	}
 
 	// Update rates every second
@@ -651,6 +681,129 @@ func (fs *FlowStore) Add(flows []types.Flow) {
 		fs.bytesInWindow = 0
 		fs.lastStatsUpdate = now
 	}
+}
+
+// evictFlows implements the hybrid eviction strategy: Top-K + LRU + FIFO
+func (fs *FlowStore) evictFlows() {
+	now := time.Now()
+	toEvict := len(fs.flows) - fs.maxFlows
+	if toEvict <= 0 {
+		return
+	}
+
+	// Calculate Top-K count from percentage of max-flows
+	topKCount := int(float64(fs.maxFlows) * fs.evictionConfig.TopKPercent / 100.0)
+	if topKCount < 0 {
+		topKCount = 0
+	}
+
+	// Step 1: Find Top-K flows by bytes (elephant flows)
+	topKThreshold := uint64(0)
+	if topKCount > 0 && topKCount < len(fs.flows) {
+		// Find the Kth largest byte count
+		byteCounts := make([]uint64, len(fs.flows))
+		for i, f := range fs.flows {
+			byteCounts[i] = f.Bytes
+		}
+		sort.Slice(byteCounts, func(i, j int) bool {
+			return byteCounts[i] > byteCounts[j] // descending
+		})
+		if topKCount < len(byteCounts) {
+			topKThreshold = byteCounts[topKCount-1]
+		}
+	}
+
+	// Step 2: Classify flows into protected and evictable
+	type flowWithIndex struct {
+		index     int
+		protected bool
+		reason    string // "topk", "lru", or ""
+	}
+
+	classification := make([]flowWithIndex, len(fs.flows))
+	topKProtected := 0
+	lruCount := 0
+
+	for i, f := range fs.flows {
+		classification[i].index = i
+
+		// Check Top-K protection (elephant flows)
+		if topKThreshold > 0 && f.Bytes >= topKThreshold && topKProtected < topKCount {
+			classification[i].protected = true
+			classification[i].reason = "topk"
+			topKProtected++
+			continue
+		}
+
+		// Check LRU protection (recently accessed)
+		if !f.LastAccessed.IsZero() && now.Sub(f.LastAccessed) < fs.evictionConfig.LRUWindow {
+			classification[i].protected = true
+			classification[i].reason = "lru"
+			lruCount++
+			continue
+		}
+	}
+
+	// Step 3: Collect evictable flows (FIFO order - oldest first)
+	evictable := make([]int, 0, len(fs.flows)-topKProtected-lruCount)
+	for _, c := range classification {
+		if !c.protected {
+			evictable = append(evictable, c.index)
+		}
+	}
+
+	// Step 4: Mark flows to remove (oldest first from evictable)
+	toRemove := make(map[int]bool)
+	removed := 0
+	for _, idx := range evictable {
+		if removed >= toEvict {
+			break
+		}
+		toRemove[idx] = true
+		removed++
+	}
+
+	// If still need to evict more, take from LRU pool (oldest accessed first)
+	if removed < toEvict {
+		// Sort LRU flows by LastAccessed
+		type lruFlow struct {
+			index      int
+			lastAccess time.Time
+		}
+		lruFlows := make([]lruFlow, 0)
+		for _, c := range classification {
+			if c.reason == "lru" {
+				lruFlows = append(lruFlows, lruFlow{c.index, fs.flows[c.index].LastAccessed})
+			}
+		}
+		sort.Slice(lruFlows, func(i, j int) bool {
+			return lruFlows[i].lastAccess.Before(lruFlows[j].lastAccess)
+		})
+		for _, lf := range lruFlows {
+			if removed >= toEvict {
+				break
+			}
+			toRemove[lf.index] = true
+			removed++
+			lruCount--
+		}
+	}
+
+	// Step 5: Build new flow slice without removed flows
+	newFlows := make([]types.Flow, 0, fs.maxFlows)
+	for i, f := range fs.flows {
+		if !toRemove[i] {
+			newFlows = append(newFlows, f)
+		}
+	}
+
+	// Update eviction stats
+	fs.evictionStats.TotalEvicted += uint64(removed)
+	fs.evictionStats.FIFOEvicted += uint64(removed)
+	fs.evictionStats.TopKProtected = topKProtected
+	fs.evictionStats.LRUProtected = lruCount
+
+	fs.flows = newFlows
 }
 
 // Query returns flows matching the filter, sorted by the specified field
@@ -809,4 +962,66 @@ func (fs *FlowStore) Clear() {
 	defer fs.mu.Unlock()
 
 	fs.flows = fs.flows[:0]
+}
+
+// GetEvictionStats returns current eviction statistics
+func (fs *FlowStore) GetEvictionStats() EvictionStats {
+	fs.mu.RLock()
+	defer fs.mu.RUnlock()
+	return fs.evictionStats
+}
+
+// GetEvictionConfig returns current eviction configuration
+func (fs *FlowStore) GetEvictionConfig() EvictionConfig {
+	return fs.evictionConfig
+}
+
+// SetEvictionConfig updates eviction configuration
+func (fs *FlowStore) SetEvictionConfig(config EvictionConfig) {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	fs.evictionConfig = config
+}
+
+// MarkFlowAccessed marks a flow as recently accessed for LRU protection
+// flowKey is the FlowKey() of the flow to mark
+func (fs *FlowStore) MarkFlowAccessed(flowKey string) {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+
+	now := time.Now()
+	for i := range fs.flows {
+		if fs.flows[i].FlowKey() == flowKey {
+			fs.flows[i].LastAccessed = now
+			break
+		}
+	}
+}
+
+// MarkFlowsAccessed marks multiple flows as recently accessed
+// This is called when flows are displayed in the TUI
+func (fs *FlowStore) MarkFlowsAccessed(flowKeys []string) {
+	if len(flowKeys) == 0 {
+		return
+	}
+
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+
+	keySet := make(map[string]bool, len(flowKeys))
+	for _, k := range flowKeys {
+		keySet[k] = true
+	}
+
+	now := time.Now()
+	marked := 0
+	for i := range fs.flows {
+		if keySet[fs.flows[i].FlowKey()] {
+			fs.flows[i].LastAccessed = now
+			marked++
+			if marked >= len(flowKeys) {
+				break
+			}
+		}
+	}
 }

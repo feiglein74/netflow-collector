@@ -19,12 +19,22 @@ func main() {
 	refreshRate := flag.Duration("refresh", 500*time.Millisecond, "Display refresh rate")
 	simple := flag.Bool("simple", false, "Use simple CLI instead of interactive TUI")
 
+	// Eviction settings
+	topKPercent := flag.Float64("topk-percent", 1.0, "Percent of max-flows to protect as elephant flows (1.0 = 1%)")
+	lruWindow := flag.Duration("lru-window", 5*time.Minute, "Protect recently viewed flows for this duration")
+
 	flag.Parse()
+
+	// Create eviction config
+	evictionConfig := store.EvictionConfig{
+		TopKPercent: *topKPercent,
+		LRUWindow:   *lruWindow,
+	}
 
 	// Create components
 	udpListener := listener.New(*port)
 	flowParser := parser.New()
-	flowStore := store.New(*maxFlows)
+	flowStore := store.NewWithConfig(*maxFlows, evictionConfig)
 
 	// Start UDP listener
 	if err := udpListener.Start(); err != nil {
@@ -69,6 +79,7 @@ func main() {
 
 	// Print final stats
 	stats := flowStore.GetStats()
+	evictStats := flowStore.GetEvictionStats()
 	fmt.Printf("\nFinal Statistics:\n")
 	fmt.Printf("  Total Flows: %d\n", stats.TotalFlows)
 	fmt.Printf("  Total Bytes: %d\n", stats.TotalBytes)
@@ -76,4 +87,10 @@ func main() {
 	fmt.Printf("  NetFlow v5: %d\n", stats.V5Flows)
 	fmt.Printf("  NetFlow v9: %d\n", stats.V9Flows)
 	fmt.Printf("  IPFIX: %d\n", stats.IPFIXFlows)
+	if evictStats.TotalEvicted > 0 {
+		fmt.Printf("\nEviction Statistics:\n")
+		fmt.Printf("  Total Evicted: %d\n", evictStats.TotalEvicted)
+		fmt.Printf("  TopK Protected: %d\n", evictStats.TopKProtected)
+		fmt.Printf("  LRU Protected: %d\n", evictStats.LRUProtected)
+	}
 }

@@ -473,7 +473,7 @@ func (t *TUI) applyFilterFromInput() {
 
 // setupInterfaceTableHeaders sets up the interface table headers
 func (t *TUI) setupInterfaceTableHeaders() {
-	headers := []string{"*", "Interface", "Subnet (guessed)", "IPs", "In Flows", "Out Flows", "Total", "In Bytes", "Out Bytes"}
+	headers := []string{"*", "Interface", "Subnet (guessed)", "Int", "Ext", "In Flows", "Out Flows", "Total", "In Bytes", "Out Bytes"}
 	for i, h := range headers {
 		expansion := 1
 		if i == 0 {
@@ -502,17 +502,19 @@ func (t *TUI) switchPage() {
 
 // InterfaceStats holds statistics for a single interface
 type InterfaceStats struct {
-	ID            uint16
-	InFlows       int
-	OutFlows      int
-	InBytes       uint64
-	OutBytes      uint64
-	PrivateIPs    map[string]bool // Set of private IPv4s seen on this interface
-	PrivateIPv6s  map[string]bool // Set of private/ULA IPv6s seen on this interface
-	LastSubnet    string          // Last calculated IPv4 subnet
-	LastSubnetV6  string          // Last calculated IPv6 subnet
-	SubnetChanged time.Time       // When IPv4 subnet last changed
-	SubnetV6Changed time.Time     // When IPv6 subnet last changed
+	ID              uint16
+	InFlows         int
+	OutFlows        int
+	InBytes         uint64
+	OutBytes        uint64
+	PrivateIPs      map[string]bool // Set of private IPv4s seen on this interface
+	PrivateIPv6s    map[string]bool // Set of private/ULA IPv6s seen on this interface
+	PublicIPs       map[string]bool // Set of public IPv4s seen on this interface
+	PublicIPv6s     map[string]bool // Set of public IPv6s seen on this interface
+	LastSubnet      string          // Last calculated IPv4 subnet
+	LastSubnetV6    string          // Last calculated IPv6 subnet
+	SubnetChanged   time.Time       // When IPv4 subnet last changed
+	SubnetV6Changed time.Time       // When IPv6 subnet last changed
 }
 
 // isPrivateIP checks if an IP is in a private/local range
@@ -780,17 +782,27 @@ func (t *TUI) updateInterfaceStats() {
 					ID:           flow.InputIf,
 					PrivateIPs:   make(map[string]bool),
 					PrivateIPv6s: make(map[string]bool),
+					PublicIPs:    make(map[string]bool),
+					PublicIPv6s:  make(map[string]bool),
 				}
 			}
 			stats := t.interfaceStats[flow.InputIf]
 			stats.InFlows++
 			stats.InBytes += flow.Bytes
-			// Collect private source IPs (the network behind this input interface)
-			if isPrivateIP(flow.SrcAddr) {
-				if flow.SrcAddr.To4() != nil {
-					stats.PrivateIPs[flow.SrcAddr.String()] = true
+			// Collect source IPs (the network behind this input interface)
+			if flow.SrcAddr != nil && !flow.SrcAddr.IsUnspecified() {
+				if isPrivateIP(flow.SrcAddr) {
+					if flow.SrcAddr.To4() != nil {
+						stats.PrivateIPs[flow.SrcAddr.String()] = true
+					} else {
+						stats.PrivateIPv6s[flow.SrcAddr.String()] = true
+					}
 				} else {
-					stats.PrivateIPv6s[flow.SrcAddr.String()] = true
+					if flow.SrcAddr.To4() != nil {
+						stats.PublicIPs[flow.SrcAddr.String()] = true
+					} else {
+						stats.PublicIPv6s[flow.SrcAddr.String()] = true
+					}
 				}
 			}
 		}
@@ -801,17 +813,27 @@ func (t *TUI) updateInterfaceStats() {
 					ID:           flow.OutputIf,
 					PrivateIPs:   make(map[string]bool),
 					PrivateIPv6s: make(map[string]bool),
+					PublicIPs:    make(map[string]bool),
+					PublicIPv6s:  make(map[string]bool),
 				}
 			}
 			stats := t.interfaceStats[flow.OutputIf]
 			stats.OutFlows++
 			stats.OutBytes += flow.Bytes
-			// Collect private dest IPs (the network behind this output interface)
-			if isPrivateIP(flow.DstAddr) {
-				if flow.DstAddr.To4() != nil {
-					stats.PrivateIPs[flow.DstAddr.String()] = true
+			// Collect dest IPs (the network behind this output interface)
+			if flow.DstAddr != nil && !flow.DstAddr.IsUnspecified() {
+				if isPrivateIP(flow.DstAddr) {
+					if flow.DstAddr.To4() != nil {
+						stats.PrivateIPs[flow.DstAddr.String()] = true
+					} else {
+						stats.PrivateIPv6s[flow.DstAddr.String()] = true
+					}
 				} else {
-					stats.PrivateIPv6s[flow.DstAddr.String()] = true
+					if flow.DstAddr.To4() != nil {
+						stats.PublicIPs[flow.DstAddr.String()] = true
+					} else {
+						stats.PublicIPv6s[flow.DstAddr.String()] = true
+					}
 				}
 			}
 		}
@@ -875,9 +897,11 @@ func (t *TUI) updateInterfaceTable() {
 	row := 1
 	for _, s := range sortedStats {
 		totalFlows := s.InFlows + s.OutFlows
-		ipv4Count := len(s.PrivateIPs)
-		ipv6Count := len(s.PrivateIPv6s)
-		hasIPv6 := ipv6Count > 0
+		intIPv4Count := len(s.PrivateIPs)
+		intIPv6Count := len(s.PrivateIPv6s)
+		extIPv4Count := len(s.PublicIPs)
+		extIPv6Count := len(s.PublicIPv6s)
+		hasIPv6 := intIPv6Count > 0 || extIPv6Count > 0
 
 		// Determine subnet colors - yellow for 5 seconds after change
 		subnetColor := tcell.ColorLightCyan
@@ -905,12 +929,13 @@ func (t *TUI) updateInterfaceTable() {
 		t.interfaceTable.SetCell(row, 0, tview.NewTableCell(marker).SetTextColor(tcell.ColorGreen).SetExpansion(0))
 		t.interfaceTable.SetCell(row, 1, tview.NewTableCell(fmt.Sprintf("%d", s.ID)).SetExpansion(1))
 		t.interfaceTable.SetCell(row, 2, tview.NewTableCell(subnetV4).SetTextColor(subnetColor).SetExpansion(1))
-		t.interfaceTable.SetCell(row, 3, tview.NewTableCell(formatNumber(ipv4Count)).SetAlign(tview.AlignRight).SetExpansion(1))
-		t.interfaceTable.SetCell(row, 4, tview.NewTableCell(formatNumber(s.InFlows)).SetAlign(tview.AlignRight).SetExpansion(1))
-		t.interfaceTable.SetCell(row, 5, tview.NewTableCell(formatNumber(s.OutFlows)).SetAlign(tview.AlignRight).SetExpansion(1))
-		t.interfaceTable.SetCell(row, 6, tview.NewTableCell(formatNumber(totalFlows)).SetAlign(tview.AlignRight).SetExpansion(1))
-		t.interfaceTable.SetCell(row, 7, tview.NewTableCell(formatBytes(s.InBytes)).SetAlign(tview.AlignRight).SetExpansion(1))
-		t.interfaceTable.SetCell(row, 8, tview.NewTableCell(formatBytes(s.OutBytes)).SetAlign(tview.AlignRight).SetExpansion(1))
+		t.interfaceTable.SetCell(row, 3, tview.NewTableCell(formatNumber(intIPv4Count)).SetAlign(tview.AlignRight).SetExpansion(1))
+		t.interfaceTable.SetCell(row, 4, tview.NewTableCell(formatNumber(extIPv4Count)).SetAlign(tview.AlignRight).SetExpansion(1))
+		t.interfaceTable.SetCell(row, 5, tview.NewTableCell(formatNumber(s.InFlows)).SetAlign(tview.AlignRight).SetExpansion(1))
+		t.interfaceTable.SetCell(row, 6, tview.NewTableCell(formatNumber(s.OutFlows)).SetAlign(tview.AlignRight).SetExpansion(1))
+		t.interfaceTable.SetCell(row, 7, tview.NewTableCell(formatNumber(totalFlows)).SetAlign(tview.AlignRight).SetExpansion(1))
+		t.interfaceTable.SetCell(row, 8, tview.NewTableCell(formatBytes(s.InBytes)).SetAlign(tview.AlignRight).SetExpansion(1))
+		t.interfaceTable.SetCell(row, 9, tview.NewTableCell(formatBytes(s.OutBytes)).SetAlign(tview.AlignRight).SetExpansion(1))
 		row++
 
 		// Row 2: IPv6 data (only if IPv6 addresses exist)
@@ -918,13 +943,14 @@ func (t *TUI) updateInterfaceTable() {
 			t.interfaceTable.SetCell(row, 0, tview.NewTableCell("").SetExpansion(0))
 			t.interfaceTable.SetCell(row, 1, tview.NewTableCell("").SetExpansion(1))
 			t.interfaceTable.SetCell(row, 2, tview.NewTableCell(s.LastSubnetV6).SetTextColor(subnetV6Color).SetExpansion(1))
-			t.interfaceTable.SetCell(row, 3, tview.NewTableCell(formatNumber(ipv6Count)).SetAlign(tview.AlignRight).SetExpansion(1))
+			t.interfaceTable.SetCell(row, 3, tview.NewTableCell(formatNumber(intIPv6Count)).SetAlign(tview.AlignRight).SetExpansion(1))
+			t.interfaceTable.SetCell(row, 4, tview.NewTableCell(formatNumber(extIPv6Count)).SetAlign(tview.AlignRight).SetExpansion(1))
 			// Leave flow/byte columns empty for IPv6 row
-			t.interfaceTable.SetCell(row, 4, tview.NewTableCell("").SetExpansion(1))
 			t.interfaceTable.SetCell(row, 5, tview.NewTableCell("").SetExpansion(1))
 			t.interfaceTable.SetCell(row, 6, tview.NewTableCell("").SetExpansion(1))
 			t.interfaceTable.SetCell(row, 7, tview.NewTableCell("").SetExpansion(1))
 			t.interfaceTable.SetCell(row, 8, tview.NewTableCell("").SetExpansion(1))
+			t.interfaceTable.SetCell(row, 9, tview.NewTableCell("").SetExpansion(1))
 			row++
 		}
 	}
@@ -1045,35 +1071,110 @@ func (t *TUI) updateIPDetailTable() {
 		return
 	}
 
-	// Collect all IPs
-	var allIPs []string
+	// Collect all IPs with type info
+	type ipEntry struct {
+		ip     string
+		isPrivate bool
+	}
+	var allEntries []ipEntry
 	for ip := range stats.PrivateIPs {
-		allIPs = append(allIPs, ip)
+		allEntries = append(allEntries, ipEntry{ip, true})
 	}
 	for ip := range stats.PrivateIPv6s {
-		allIPs = append(allIPs, ip)
+		allEntries = append(allEntries, ipEntry{ip, true})
 	}
-	sortIPsByRange(allIPs)
+	for ip := range stats.PublicIPs {
+		allEntries = append(allEntries, ipEntry{ip, false})
+	}
+	for ip := range stats.PublicIPv6s {
+		allEntries = append(allEntries, ipEntry{ip, false})
+	}
+
+	// Sort: private first, then public, each sorted by range
+	var privateIPs, publicIPs []string
+	for _, e := range allEntries {
+		if e.isPrivate {
+			privateIPs = append(privateIPs, e.ip)
+		} else {
+			publicIPs = append(publicIPs, e.ip)
+		}
+	}
+	sortIPsByRange(privateIPs)
+	sortIPsByRange(publicIPs)
+
+	// Rebuild sorted entries: private first, then public
+	allEntries = nil
+	for _, ip := range privateIPs {
+		allEntries = append(allEntries, ipEntry{ip, true})
+	}
+	for _, ip := range publicIPs {
+		allEntries = append(allEntries, ipEntry{ip, false})
+	}
 
 	// Remember selection position
 	selectedRow, _ := t.ipDetailTable.GetSelection()
 
 	// Update table
 	t.ipDetailTable.Clear()
-	t.ipDetailTable.SetBorder(true).SetTitle(fmt.Sprintf(" Interface %d - %d IPs [Space=Mark] [Enter=Filter] [Esc=Close] ", t.ipDetailIfaceID, len(allIPs)))
+	intCount := len(privateIPs)
+	extCount := len(publicIPs)
+	t.ipDetailTable.SetBorder(true).SetTitle(fmt.Sprintf(" Interface %d - %d Int / %d Ext [Space=Mark] [Enter=Filter] [Esc=Close] ", t.ipDetailIfaceID, intCount, extCount))
 
-	for i, ip := range allIPs {
+	// Header row
+	t.ipDetailTable.SetCell(0, 0, tview.NewTableCell(" ").SetTextColor(tcell.ColorYellow).SetSelectable(false))
+	t.ipDetailTable.SetCell(0, 1, tview.NewTableCell("Type").SetTextColor(tcell.ColorYellow).SetSelectable(false))
+	t.ipDetailTable.SetCell(0, 2, tview.NewTableCell("IP Address").SetTextColor(tcell.ColorYellow).SetSelectable(false).SetExpansion(1))
+	t.ipDetailTable.SetCell(0, 3, tview.NewTableCell("Hostname").SetTextColor(tcell.ColorYellow).SetSelectable(false).SetExpansion(2))
+
+	for i, entry := range allEntries {
+		row := i + 1 // +1 for header
 		marker := " "
-		if t.ipDetailSelected[ip] {
+		if t.ipDetailSelected[entry.ip] {
 			marker = "*"
 		}
-		t.ipDetailTable.SetCell(i, 0, tview.NewTableCell(marker).SetTextColor(tcell.ColorGreen))
-		t.ipDetailTable.SetCell(i, 1, tview.NewTableCell(ip).SetExpansion(1))
+
+		// Type indicator
+		typeStr := "ext"
+		typeColor := tcell.ColorOrange
+		if entry.isPrivate {
+			typeStr = "int"
+			typeColor = tcell.ColorGreen
+		}
+
+		// DNS lookup - always try to resolve for IP detail view
+		hostname := ""
+		if parsedIP := net.ParseIP(entry.ip); parsedIP != nil {
+			// First check cache
+			if cached, ok := t.resolver.GetCached(parsedIP); ok {
+				hostname = cached
+			} else {
+				// No cache - trigger async lookup for next refresh
+				wasEnabled := t.resolver.IsEnabled()
+				if !wasEnabled {
+					t.resolver.SetEnabled(true)
+				}
+				t.resolver.Resolve(parsedIP)
+				if !wasEnabled {
+					t.resolver.SetEnabled(false)
+				}
+				hostname = "[...]" // Indicate lookup in progress
+			}
+		}
+
+		t.ipDetailTable.SetCell(row, 0, tview.NewTableCell(marker).SetTextColor(tcell.ColorGreen))
+		t.ipDetailTable.SetCell(row, 1, tview.NewTableCell(typeStr).SetTextColor(typeColor))
+		t.ipDetailTable.SetCell(row, 2, tview.NewTableCell(entry.ip).SetExpansion(1))
+		t.ipDetailTable.SetCell(row, 3, tview.NewTableCell(hostname).SetTextColor(tcell.ColorAqua).SetExpansion(2))
 	}
 
-	// Restore selection if valid
-	if selectedRow >= 0 && selectedRow < len(allIPs) {
+	// Fix selection to skip header
+	t.ipDetailTable.SetFixed(1, 0)
+
+	// Restore selection if valid (account for header row)
+	if selectedRow >= 1 && selectedRow <= len(allEntries) {
 		t.ipDetailTable.Select(selectedRow, 0)
+	} else if len(allEntries) > 0 {
+		t.ipDetailTable.Select(1, 0) // Select first data row
 	}
 }
 
@@ -1088,19 +1189,14 @@ func (t *TUI) toggleIPDetailSelection() {
 		return
 	}
 
-	// Get current IPs
-	var allIPs []string
-	for ip := range stats.PrivateIPs {
-		allIPs = append(allIPs, ip)
-	}
-	for ip := range stats.PrivateIPv6s {
-		allIPs = append(allIPs, ip)
-	}
-	sortIPsByRange(allIPs)
+	// Get all IPs (private first, then public)
+	allIPs := t.getAllInterfaceIPs(stats)
 
 	row, _ := t.ipDetailTable.GetSelection()
-	if row >= 0 && row < len(allIPs) {
-		ip := allIPs[row]
+	// Account for header row (row 0 is header, data starts at row 1)
+	dataIndex := row - 1
+	if dataIndex >= 0 && dataIndex < len(allIPs) {
+		ip := allIPs[dataIndex]
 		if t.ipDetailSelected[ip] {
 			delete(t.ipDetailSelected, ip)
 		} else {
@@ -1108,6 +1204,26 @@ func (t *TUI) toggleIPDetailSelection() {
 		}
 		t.updateIPDetailTable()
 	}
+}
+
+// getAllInterfaceIPs returns all IPs for an interface (private first, then public)
+func (t *TUI) getAllInterfaceIPs(stats *InterfaceStats) []string {
+	var privateIPs, publicIPs []string
+	for ip := range stats.PrivateIPs {
+		privateIPs = append(privateIPs, ip)
+	}
+	for ip := range stats.PrivateIPv6s {
+		privateIPs = append(privateIPs, ip)
+	}
+	for ip := range stats.PublicIPs {
+		publicIPs = append(publicIPs, ip)
+	}
+	for ip := range stats.PublicIPv6s {
+		publicIPs = append(publicIPs, ip)
+	}
+	sortIPsByRange(privateIPs)
+	sortIPsByRange(publicIPs)
+	return append(privateIPs, publicIPs...)
 }
 
 // applyIPDetailFilter applies filter from selected IPs
@@ -1121,15 +1237,8 @@ func (t *TUI) applyIPDetailFilter() {
 		return
 	}
 
-	// Get current IPs
-	var allIPs []string
-	for ip := range stats.PrivateIPs {
-		allIPs = append(allIPs, ip)
-	}
-	for ip := range stats.PrivateIPv6s {
-		allIPs = append(allIPs, ip)
-	}
-	sortIPsByRange(allIPs)
+	// Get all IPs (private first, then public)
+	allIPs := t.getAllInterfaceIPs(stats)
 
 	var ipsToFilter []string
 	if len(t.ipDetailSelected) > 0 {
@@ -1137,10 +1246,11 @@ func (t *TUI) applyIPDetailFilter() {
 			ipsToFilter = append(ipsToFilter, ip)
 		}
 	} else {
-		// Use current row
+		// Use current row (account for header row)
 		row, _ := t.ipDetailTable.GetSelection()
-		if row >= 0 && row < len(allIPs) {
-			ipsToFilter = append(ipsToFilter, allIPs[row])
+		dataIndex := row - 1
+		if dataIndex >= 0 && dataIndex < len(allIPs) {
+			ipsToFilter = append(ipsToFilter, allIPs[dataIndex])
 		}
 	}
 
@@ -1508,6 +1618,9 @@ func (t *TUI) showFlowDetail() {
 	flow := t.currentFlows[row-1] // -1 for header row
 	t.showDetail = true
 
+	// Mark this flow as accessed for LRU protection
+	t.store.MarkFlowAccessed(flow.FlowKey())
+
 	// Format flow details
 	text := fmt.Sprintf(`[yellow]═══ Network Layer ═══[white]
 [green]Source IP:[white]      %s
@@ -1711,13 +1824,24 @@ func (t *TUI) updateStats() {
 		memText = "[yellow]" + memText + "[white]"
 	}
 
+	// Eviction stats - show when eviction has occurred
+	evictionStats := t.store.GetEvictionStats()
+	evictionText := ""
+	if evictionStats.TotalEvicted > 0 {
+		evictionText = fmt.Sprintf("  [yellow]Evicted:[white] %s [gray](TopK:%d LRU:%d)[white]",
+			formatNumber(int(evictionStats.TotalEvicted)),
+			evictionStats.TopKProtected,
+			evictionStats.LRUProtected)
+	}
+
 	text := fmt.Sprintf(
-		"[yellow]Flows:[white] %s  [yellow]Mem:[white] %s  [yellow]Rate:[white] %s/s  [yellow]Throughput:[white] %s/s%s\n"+
+		"[yellow]Flows:[white] %s  [yellow]Mem:[white] %s  [yellow]Rate:[white] %s/s  [yellow]Throughput:[white] %s/s%s%s\n"+
 			"[yellow]Versions:[white] %s  [yellow]Exporters:[white] %d  [yellow]Showing:[white] %s%s",
 		formatNumber(int(stats.TotalFlows)),
 		memText,
 		formatDecimal(stats.FlowsPerSecond, 1),
 		formatBytes(uint64(stats.BytesPerSecond)),
+		evictionText,
 		pauseIndicator,
 		versionText,
 		stats.UniqueExporters,
