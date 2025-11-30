@@ -15,8 +15,7 @@ import (
 func main() {
 	// Command line flags
 	port := flag.Int("port", 2055, "UDP port to listen on")
-	maxFlows := flag.Int("max-flows", 10000, "Maximum flows to keep in memory")
-	retention := flag.Duration("retention", 5*time.Minute, "How long to keep flows in memory")
+	maxFlows := flag.Int("max-flows", 100000, "Maximum flows to keep in memory")
 	refreshRate := flag.Duration("refresh", 500*time.Millisecond, "Display refresh rate")
 	simple := flag.Bool("simple", false, "Use simple CLI instead of interactive TUI")
 
@@ -25,7 +24,7 @@ func main() {
 	// Create components
 	udpListener := listener.New(*port)
 	flowParser := parser.New()
-	flowStore := store.New(*maxFlows, *retention)
+	flowStore := store.New(*maxFlows)
 
 	// Start UDP listener
 	if err := udpListener.Start(); err != nil {

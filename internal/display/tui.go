@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -73,7 +74,21 @@ type TUI struct {
 	detailView  *tview.TextView
 	filterInput *tview.InputField
 	layout      *tview.Flex
-	pages       *tview.Pages // For overlay dropdown
+	pages       *tview.Pages // For overlay dropdown and page switching
+
+	// Interface statistics page
+	interfaceTable       *tview.Table
+	interfaceLayout      *tview.Flex
+	currentPage          int                        // 0 = flows, 1 = interfaces
+	interfaceStats       map[uint16]*InterfaceStats // Cumulative interface statistics
+	lastInterfaceUpdate  time.Time                  // Track when we last updated stats
+	selectedInterfaces   map[uint16]bool            // Interfaces marked with Space for filtering
+
+	// IP detail modal state
+	ipDetailTable     *tview.Table
+	ipDetailIfaceID   uint16
+	ipDetailSelected  map[string]bool
+	ipDetailVisible   bool
 
 	// Autocomplete dropdown overlay
 	dropdown        *tview.List
@@ -113,15 +128,17 @@ func NewTUI(s *store.FlowStore, refreshRate time.Duration) *TUI {
 	}
 
 	t := &TUI{
-		app:           tview.NewApplication(),
-		store:         s,
-		resolver:      resolver.New(),
-		sortField:     store.SortByTime,
-		sortAsc:       false,
-		showService:   true, // Enable service names by default
-		refreshRate:   refreshRate,
-		stopChan:      make(chan struct{}),
-		filterHistory: loadFilterHistory(),
+		app:            tview.NewApplication(),
+		store:          s,
+		resolver:       resolver.New(),
+		sortField:      store.SortByTime,
+		sortAsc:        false,
+		showService:    true, // Enable service names by default
+		refreshRate:    refreshRate,
+		stopChan:       make(chan struct{}),
+		filterHistory:  loadFilterHistory(),
+		interfaceStats:     make(map[uint16]*InterfaceStats),
+		selectedInterfaces: make(map[uint16]bool),
 	}
 
 	t.setupUI()
@@ -146,7 +163,53 @@ func (t *TUI) setupUI() {
 		SetBorders(false).
 		SetSelectable(true, false).
 		SetFixed(1, 0)
-	t.table.SetBorder(true).SetTitle(" Flows ")
+	t.table.SetBorder(true).SetTitle(" Flows [F2=Interfaces] ")
+
+	// Interface statistics table
+	t.interfaceTable = tview.NewTable().
+		SetBorders(false).
+		SetSelectable(true, false).
+		SetFixed(1, 0)
+	t.interfaceTable.SetBorder(true).SetTitle(" Interfaces [F1=Flows] [Space=Mark] [Enter=Filter] ")
+	t.setupInterfaceTableHeaders()
+
+	// Interface table key handling
+	t.interfaceTable.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		switch event.Key() {
+		case tcell.KeyRune:
+			if event.Rune() == ' ' {
+				// Toggle selection of current interface
+				row, _ := t.interfaceTable.GetSelection()
+				if row > 0 { // Skip header
+					ifaceID := t.getInterfaceIDFromRow(row)
+					if ifaceID > 0 {
+						if t.selectedInterfaces[ifaceID] {
+							delete(t.selectedInterfaces, ifaceID)
+						} else {
+							t.selectedInterfaces[ifaceID] = true
+						}
+						t.updateInterfaceTable()
+					}
+				}
+				return nil
+			}
+		case tcell.KeyEnter:
+			if len(t.selectedInterfaces) > 0 {
+				// Switch to flows page with filter for selected interfaces
+				t.applyInterfaceFilter()
+				return nil
+			} else {
+				// Show IP detail view for current interface
+				row, _ := t.interfaceTable.GetSelection()
+				ifaceID := t.getInterfaceIDFromRow(row)
+				if ifaceID > 0 {
+					t.showInterfaceDetail(ifaceID)
+					return nil
+				}
+			}
+		}
+		return event
+	})
 
 	// Filter input (no tview autocomplete - we use our own overlay)
 	t.filterInput = tview.NewInputField().
@@ -186,7 +249,8 @@ func (t *TUI) setupUI() {
 				}
 				return nil
 			}
-		case tcell.KeyTab, tcell.KeyEnter:
+		case tcell.KeyTab:
+			// Tab only selects from dropdown, doesn't apply filter
 			if t.dropdownVisible && t.dropdown.GetItemCount() > 0 {
 				idx := t.dropdown.GetCurrentItem()
 				if idx >= 0 && idx < len(t.suggestions) {
@@ -195,6 +259,18 @@ func (t *TUI) setupUI() {
 				t.hideDropdown()
 				return nil
 			}
+		case tcell.KeyEnter:
+			// Enter applies the filter (and selects from dropdown if visible)
+			if t.dropdownVisible && t.dropdown.GetItemCount() > 0 {
+				idx := t.dropdown.GetCurrentItem()
+				if idx >= 0 && idx < len(t.suggestions) {
+					t.filterInput.SetText(t.suggestions[idx])
+				}
+				t.hideDropdown()
+			}
+			// Apply the filter
+			t.applyFilterFromInput()
+			return nil
 		case tcell.KeyEscape:
 			if t.dropdownVisible {
 				t.hideDropdown()
@@ -232,23 +308,48 @@ func (t *TUI) setupUI() {
 		AddItem(t.statsView, 0, 2, false).
 		AddItem(t.filterView, 0, 1, false)
 
-	// Main layout
+	// Main layout (Flows page)
 	t.layout = tview.NewFlex().SetDirection(tview.FlexRow).
 		AddItem(t.filterInput, 3, 0, true).
 		AddItem(topRow, 7, 0, false).
 		AddItem(t.table, 0, 1, false)
 
-	// Pages for overlay support
+	// Interface layout (Interfaces page)
+	interfaceTopRow := tview.NewFlex().
+		AddItem(t.statsView, 0, 1, false)
+	t.interfaceLayout = tview.NewFlex().SetDirection(tview.FlexRow).
+		AddItem(interfaceTopRow, 5, 0, false).
+		AddItem(t.interfaceTable, 0, 1, true)
+
+	// Pages for page switching and overlay support
 	t.pages = tview.NewPages().
-		AddPage("main", t.layout, true, true)
+		AddPage("flows", t.layout, true, true).
+		AddPage("interfaces", t.interfaceLayout, true, false)
 
 	// Setup table headers
 	t.setupTableHeaders()
 
-	// Only Ctrl+C to quit - no other key bindings (for now)
+	// Global key bindings
 	t.app.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		if event.Key() == tcell.KeyCtrlC {
 			t.app.Stop()
+			return nil
+		}
+		// F1/F2 switch pages
+		if event.Key() == tcell.KeyF1 {
+			if t.currentPage != 0 {
+				t.currentPage = 0
+				t.pages.SwitchToPage("flows")
+				t.app.SetFocus(t.filterInput)
+			}
+			return nil
+		}
+		if event.Key() == tcell.KeyF2 {
+			if t.currentPage != 1 {
+				t.currentPage = 1
+				t.pages.SwitchToPage("interfaces")
+				t.app.SetFocus(t.interfaceTable)
+			}
 			return nil
 		}
 		return event
@@ -340,6 +441,781 @@ func (t *TUI) clearFilter() {
 	t.filter = store.Filter{}
 }
 
+// applyFilterFromInput parses the current filter input text and applies it
+func (t *TUI) applyFilterFromInput() {
+	text := strings.TrimSpace(t.filterInput.GetText())
+	if text == "" {
+		t.filter = store.Filter{}
+	} else {
+		t.filter = store.ParseFilter(text)
+		// Add to history if valid and not already in history
+		if t.filter.IsValid() && text != "" {
+			// Check if already in history
+			found := false
+			for _, h := range t.filterHistory {
+				if h == text {
+					found = true
+					break
+				}
+			}
+			if !found {
+				// Add to front of history
+				t.filterHistory = append([]string{text}, t.filterHistory...)
+				// Keep max 20 entries
+				if len(t.filterHistory) > 20 {
+					t.filterHistory = t.filterHistory[:20]
+				}
+				saveFilterHistory(t.filterHistory)
+			}
+		}
+	}
+}
+
+// setupInterfaceTableHeaders sets up the interface table headers
+func (t *TUI) setupInterfaceTableHeaders() {
+	headers := []string{"*", "Interface", "Subnet (guessed)", "IPs", "In Flows", "Out Flows", "Total", "In Bytes", "Out Bytes"}
+	for i, h := range headers {
+		expansion := 1
+		if i == 0 {
+			expansion = 0 // Small column for marker
+		}
+		cell := tview.NewTableCell(h).
+			SetTextColor(tcell.ColorYellow).
+			SetSelectable(false).
+			SetExpansion(expansion)
+		t.interfaceTable.SetCell(0, i, cell)
+	}
+}
+
+// switchPage toggles between flows and interfaces page
+func (t *TUI) switchPage() {
+	if t.currentPage == 0 {
+		t.currentPage = 1
+		t.pages.SwitchToPage("interfaces")
+		t.app.SetFocus(t.interfaceTable)
+	} else {
+		t.currentPage = 0
+		t.pages.SwitchToPage("flows")
+		t.app.SetFocus(t.filterInput)
+	}
+}
+
+// InterfaceStats holds statistics for a single interface
+type InterfaceStats struct {
+	ID            uint16
+	InFlows       int
+	OutFlows      int
+	InBytes       uint64
+	OutBytes      uint64
+	PrivateIPs    map[string]bool // Set of private IPv4s seen on this interface
+	PrivateIPv6s  map[string]bool // Set of private/ULA IPv6s seen on this interface
+	LastSubnet    string          // Last calculated IPv4 subnet
+	LastSubnetV6  string          // Last calculated IPv6 subnet
+	SubnetChanged time.Time       // When IPv4 subnet last changed
+	SubnetV6Changed time.Time     // When IPv6 subnet last changed
+}
+
+// isPrivateIP checks if an IP is in a private/local range
+func isPrivateIP(ip net.IP) bool {
+	if ip == nil {
+		return false
+	}
+	// Convert to 4-byte representation for IPv4
+	ip4 := ip.To4()
+	if ip4 == nil {
+		// IPv6 checks
+		if len(ip) < 1 {
+			return false
+		}
+		// ULA (Unique Local Address) fd00::/8 (fc00::/7 but only fd00::/8 is used in practice)
+		if ip[0] == 0xfd {
+			return true
+		}
+		// Link-local fe80::/10
+		if ip[0] == 0xfe && (ip[1]&0xc0) == 0x80 {
+			return true
+		}
+		return false
+	}
+	// 10.0.0.0/8
+	if ip4[0] == 10 {
+		return true
+	}
+	// 172.16.0.0/12
+	if ip4[0] == 172 && ip4[1] >= 16 && ip4[1] <= 31 {
+		return true
+	}
+	// 192.168.0.0/16
+	if ip4[0] == 192 && ip4[1] == 168 {
+		return true
+	}
+	return false
+}
+
+// getPrivateRange returns which private range an IP belongs to
+// IPv4: 1=10.x, 2=172.16-31.x, 3=192.168.x
+// IPv6: 4=ULA (fd00::/8), 5=link-local (fe80::/10)
+// 0=none/public
+func getPrivateRange(ip net.IP) int {
+	ip4 := ip.To4()
+	if ip4 == nil {
+		// IPv6
+		if len(ip) < 2 {
+			return 0
+		}
+		if ip[0] == 0xfd {
+			return 4 // ULA
+		}
+		if ip[0] == 0xfe && (ip[1]&0xc0) == 0x80 {
+			return 5 // Link-local
+		}
+		return 0
+	}
+	if ip4[0] == 10 {
+		return 1
+	}
+	if ip4[0] == 172 && ip4[1] >= 16 && ip4[1] <= 31 {
+		return 2
+	}
+	if ip4[0] == 192 && ip4[1] == 168 {
+		return 3
+	}
+	return 0
+}
+
+// guessSubnetV4 derives a CIDR subnet from a set of IPv4 addresses
+func guessSubnetV4(ips map[string]bool) string {
+	if len(ips) == 0 {
+		return ""
+	}
+
+	// Group IPs by private range
+	rangeIPs := make(map[int][]net.IP)
+	for ipStr := range ips {
+		ip := net.ParseIP(ipStr)
+		if ip != nil {
+			if ip4 := ip.To4(); ip4 != nil {
+				r := getPrivateRange(ip4)
+				if r > 0 && r <= 3 { // Only IPv4 ranges
+					rangeIPs[r] = append(rangeIPs[r], ip4)
+				}
+			}
+		}
+	}
+
+	if len(rangeIPs) == 0 {
+		return ""
+	}
+
+	// Find the range with most IPs
+	var bestRange int
+	var bestCount int
+	for r, ipList := range rangeIPs {
+		if len(ipList) > bestCount {
+			bestCount = len(ipList)
+			bestRange = r
+		}
+	}
+
+	ipList := rangeIPs[bestRange]
+	if len(ipList) == 1 {
+		return ipList[0].String() + "/32"
+	}
+
+	// Find common prefix bits within the same range
+	first := ipList[0]
+	commonBits := 32
+
+	for _, ip := range ipList[1:] {
+		bits := commonPrefixBitsV4(first, ip)
+		if bits < commonBits {
+			commonBits = bits
+		}
+	}
+
+	// Sanity check - don't go below /8 for 10.x, /12 for 172.x, /16 for 192.168.x
+	minBits := 8
+	if bestRange == 2 {
+		minBits = 12
+	} else if bestRange == 3 {
+		minBits = 16
+	}
+	if commonBits < minBits {
+		commonBits = minBits
+	}
+
+	// Create network address (zero out host bits)
+	mask := net.CIDRMask(commonBits, 32)
+	network := first.Mask(mask)
+
+	return fmt.Sprintf("%s/%d", network.String(), commonBits)
+}
+
+// guessSubnetV6 derives a CIDR subnet from a set of IPv6 addresses
+func guessSubnetV6(ips map[string]bool) string {
+	if len(ips) == 0 {
+		return ""
+	}
+
+	// Group IPs by IPv6 range (4=ULA, 5=link-local)
+	rangeIPs := make(map[int][]net.IP)
+	for ipStr := range ips {
+		ip := net.ParseIP(ipStr)
+		if ip != nil && ip.To4() == nil { // IPv6 only
+			r := getPrivateRange(ip)
+			if r >= 4 { // IPv6 ranges
+				rangeIPs[r] = append(rangeIPs[r], ip)
+			}
+		}
+	}
+
+	if len(rangeIPs) == 0 {
+		return ""
+	}
+
+	// Find the range with most IPs
+	var bestRange int
+	var bestCount int
+	for r, ipList := range rangeIPs {
+		if len(ipList) > bestCount {
+			bestCount = len(ipList)
+			bestRange = r
+		}
+	}
+
+	ipList := rangeIPs[bestRange]
+	if len(ipList) == 1 {
+		return ipList[0].String() + "/128"
+	}
+
+	// Find common prefix bits
+	first := ipList[0]
+	commonBits := 128
+
+	for _, ip := range ipList[1:] {
+		bits := commonPrefixBitsV6(first, ip)
+		if bits < commonBits {
+			commonBits = bits
+		}
+	}
+
+	// Sanity check - don't go below /8 for ULA, /10 for link-local
+	minBits := 8
+	if bestRange == 5 { // link-local
+		minBits = 10
+	}
+	if commonBits < minBits {
+		commonBits = minBits
+	}
+
+	// Create network address (zero out host bits)
+	mask := net.CIDRMask(commonBits, 128)
+	network := first.Mask(mask)
+
+	return fmt.Sprintf("%s/%d", network.String(), commonBits)
+}
+
+// commonPrefixBitsV4 returns the number of common prefix bits between two IPv4 addresses
+func commonPrefixBitsV4(a, b net.IP) int {
+	a4 := a.To4()
+	b4 := b.To4()
+	if a4 == nil || b4 == nil {
+		return 0
+	}
+
+	bits := 0
+	for i := 0; i < 4; i++ {
+		xor := a4[i] ^ b4[i]
+		if xor == 0 {
+			bits += 8
+		} else {
+			// Count leading zeros in the XOR result
+			for mask := byte(0x80); mask > 0 && (xor&mask) == 0; mask >>= 1 {
+				bits++
+			}
+			break
+		}
+	}
+	return bits
+}
+
+// commonPrefixBitsV6 returns the number of common prefix bits between two IPv6 addresses
+func commonPrefixBitsV6(a, b net.IP) int {
+	// Ensure we have 16-byte representation
+	if len(a) != 16 || len(b) != 16 {
+		return 0
+	}
+
+	bits := 0
+	for i := 0; i < 16; i++ {
+		xor := a[i] ^ b[i]
+		if xor == 0 {
+			bits += 8
+		} else {
+			// Count leading zeros in the XOR result
+			for mask := byte(0x80); mask > 0 && (xor&mask) == 0; mask >>= 1 {
+				bits++
+			}
+			break
+		}
+	}
+	return bits
+}
+
+// updateInterfaceStats updates cumulative interface statistics from new flows
+func (t *TUI) updateInterfaceStats() {
+	// Get all flows and only count those received after our last update
+	allFlows := t.store.Query(nil, store.SortByTime, false, 100000)
+
+	for _, flow := range allFlows {
+		// Only count flows we haven't seen yet
+		if !flow.ReceivedAt.After(t.lastInterfaceUpdate) {
+			continue
+		}
+
+		// Input interface - traffic coming IN, so SrcAddr is "behind" this interface
+		if flow.InputIf > 0 {
+			if _, ok := t.interfaceStats[flow.InputIf]; !ok {
+				t.interfaceStats[flow.InputIf] = &InterfaceStats{
+					ID:           flow.InputIf,
+					PrivateIPs:   make(map[string]bool),
+					PrivateIPv6s: make(map[string]bool),
+				}
+			}
+			stats := t.interfaceStats[flow.InputIf]
+			stats.InFlows++
+			stats.InBytes += flow.Bytes
+			// Collect private source IPs (the network behind this input interface)
+			if isPrivateIP(flow.SrcAddr) {
+				if flow.SrcAddr.To4() != nil {
+					stats.PrivateIPs[flow.SrcAddr.String()] = true
+				} else {
+					stats.PrivateIPv6s[flow.SrcAddr.String()] = true
+				}
+			}
+		}
+		// Output interface - traffic going OUT, so DstAddr is "behind" this interface
+		if flow.OutputIf > 0 {
+			if _, ok := t.interfaceStats[flow.OutputIf]; !ok {
+				t.interfaceStats[flow.OutputIf] = &InterfaceStats{
+					ID:           flow.OutputIf,
+					PrivateIPs:   make(map[string]bool),
+					PrivateIPv6s: make(map[string]bool),
+				}
+			}
+			stats := t.interfaceStats[flow.OutputIf]
+			stats.OutFlows++
+			stats.OutBytes += flow.Bytes
+			// Collect private dest IPs (the network behind this output interface)
+			if isPrivateIP(flow.DstAddr) {
+				if flow.DstAddr.To4() != nil {
+					stats.PrivateIPs[flow.DstAddr.String()] = true
+				} else {
+					stats.PrivateIPv6s[flow.DstAddr.String()] = true
+				}
+			}
+		}
+	}
+
+	t.lastInterfaceUpdate = time.Now()
+}
+
+// getInterfaceStats returns sorted interface statistics
+func (t *TUI) getInterfaceStats() []InterfaceStats {
+	// Convert to slice
+	var stats []InterfaceStats
+	for _, s := range t.interfaceStats {
+		stats = append(stats, *s)
+	}
+
+	// Sort by total flows descending
+	for i := 0; i < len(stats); i++ {
+		for j := i + 1; j < len(stats); j++ {
+			totalI := stats[i].InFlows + stats[i].OutFlows
+			totalJ := stats[j].InFlows + stats[j].OutFlows
+			if totalJ > totalI {
+				stats[i], stats[j] = stats[j], stats[i]
+			}
+		}
+	}
+
+	return stats
+}
+
+// updateInterfaceTable updates the interface statistics table
+func (t *TUI) updateInterfaceTable() {
+	// Update subnet calculations and detect changes
+	for id, stats := range t.interfaceStats {
+		// IPv4 subnet
+		newSubnet := guessSubnetV4(stats.PrivateIPs)
+		if stats.LastSubnet != "" && stats.LastSubnet != newSubnet {
+			stats.SubnetChanged = time.Now()
+		}
+		stats.LastSubnet = newSubnet
+
+		// IPv6 subnet
+		newSubnetV6 := guessSubnetV6(stats.PrivateIPv6s)
+		if stats.LastSubnetV6 != "" && stats.LastSubnetV6 != newSubnetV6 {
+			stats.SubnetV6Changed = time.Now()
+		}
+		stats.LastSubnetV6 = newSubnetV6
+
+		t.interfaceStats[id] = stats
+	}
+
+	sortedStats := t.getInterfaceStats()
+
+	// Clear existing rows (keep header)
+	rowCount := t.interfaceTable.GetRowCount()
+	for i := rowCount - 1; i > 0; i-- {
+		t.interfaceTable.RemoveRow(i)
+	}
+
+	// Add rows - two lines per interface if IPv6 is present
+	row := 1
+	for _, s := range sortedStats {
+		totalFlows := s.InFlows + s.OutFlows
+		ipv4Count := len(s.PrivateIPs)
+		ipv6Count := len(s.PrivateIPv6s)
+		hasIPv6 := ipv6Count > 0
+
+		// Determine subnet colors - yellow for 5 seconds after change
+		subnetColor := tcell.ColorLightCyan
+		if !s.SubnetChanged.IsZero() && time.Since(s.SubnetChanged) < 5*time.Second {
+			subnetColor = tcell.ColorYellow
+		}
+		subnetV6Color := tcell.ColorLightCyan
+		if !s.SubnetV6Changed.IsZero() && time.Since(s.SubnetV6Changed) < 5*time.Second {
+			subnetV6Color = tcell.ColorYellow
+		}
+
+		// Show marker if selected
+		marker := ""
+		if t.selectedInterfaces[s.ID] {
+			marker = "*"
+		}
+
+		// IPv4 subnet display (or "-" if none)
+		subnetV4 := s.LastSubnet
+		if subnetV4 == "" {
+			subnetV4 = "-"
+		}
+
+		// Row 1: Interface ID + IPv4 data + flow stats
+		t.interfaceTable.SetCell(row, 0, tview.NewTableCell(marker).SetTextColor(tcell.ColorGreen).SetExpansion(0))
+		t.interfaceTable.SetCell(row, 1, tview.NewTableCell(fmt.Sprintf("%d", s.ID)).SetExpansion(1))
+		t.interfaceTable.SetCell(row, 2, tview.NewTableCell(subnetV4).SetTextColor(subnetColor).SetExpansion(1))
+		t.interfaceTable.SetCell(row, 3, tview.NewTableCell(formatNumber(ipv4Count)).SetAlign(tview.AlignRight).SetExpansion(1))
+		t.interfaceTable.SetCell(row, 4, tview.NewTableCell(formatNumber(s.InFlows)).SetAlign(tview.AlignRight).SetExpansion(1))
+		t.interfaceTable.SetCell(row, 5, tview.NewTableCell(formatNumber(s.OutFlows)).SetAlign(tview.AlignRight).SetExpansion(1))
+		t.interfaceTable.SetCell(row, 6, tview.NewTableCell(formatNumber(totalFlows)).SetAlign(tview.AlignRight).SetExpansion(1))
+		t.interfaceTable.SetCell(row, 7, tview.NewTableCell(formatBytes(s.InBytes)).SetAlign(tview.AlignRight).SetExpansion(1))
+		t.interfaceTable.SetCell(row, 8, tview.NewTableCell(formatBytes(s.OutBytes)).SetAlign(tview.AlignRight).SetExpansion(1))
+		row++
+
+		// Row 2: IPv6 data (only if IPv6 addresses exist)
+		if hasIPv6 {
+			t.interfaceTable.SetCell(row, 0, tview.NewTableCell("").SetExpansion(0))
+			t.interfaceTable.SetCell(row, 1, tview.NewTableCell("").SetExpansion(1))
+			t.interfaceTable.SetCell(row, 2, tview.NewTableCell(s.LastSubnetV6).SetTextColor(subnetV6Color).SetExpansion(1))
+			t.interfaceTable.SetCell(row, 3, tview.NewTableCell(formatNumber(ipv6Count)).SetAlign(tview.AlignRight).SetExpansion(1))
+			// Leave flow/byte columns empty for IPv6 row
+			t.interfaceTable.SetCell(row, 4, tview.NewTableCell("").SetExpansion(1))
+			t.interfaceTable.SetCell(row, 5, tview.NewTableCell("").SetExpansion(1))
+			t.interfaceTable.SetCell(row, 6, tview.NewTableCell("").SetExpansion(1))
+			t.interfaceTable.SetCell(row, 7, tview.NewTableCell("").SetExpansion(1))
+			t.interfaceTable.SetCell(row, 8, tview.NewTableCell("").SetExpansion(1))
+			row++
+		}
+	}
+}
+
+// getInterfaceIDFromRow returns the interface ID from a table row
+// If on an IPv6 continuation row (empty interface column), looks up to find the interface
+func (t *TUI) getInterfaceIDFromRow(row int) uint16 {
+	if row <= 0 {
+		return 0
+	}
+	// Column 1 contains the interface ID (column 0 is the marker)
+	cell := t.interfaceTable.GetCell(row, 1)
+	if cell == nil {
+		return 0
+	}
+	// If this is an IPv6 continuation row (empty interface), look at the row above
+	if cell.Text == "" && row > 1 {
+		cell = t.interfaceTable.GetCell(row-1, 1)
+		if cell == nil {
+			return 0
+		}
+	}
+	var id uint16
+	fmt.Sscanf(cell.Text, "%d", &id)
+	return id
+}
+
+// applyInterfaceFilter switches to flows page with filter for selected interfaces
+func (t *TUI) applyInterfaceFilter() {
+	if len(t.selectedInterfaces) == 0 {
+		return
+	}
+
+	// Build filter string: if=1 || if=5 || if=10
+	var parts []string
+	for id := range t.selectedInterfaces {
+		parts = append(parts, fmt.Sprintf("if=%d", id))
+	}
+
+	filterStr := strings.Join(parts, " || ")
+	t.filter = store.ParseFilter(filterStr)
+	t.filterInput.SetText(filterStr)
+
+	// Clear selections after applying
+	t.selectedInterfaces = make(map[uint16]bool)
+
+	// Switch to flows page
+	t.currentPage = 0
+	t.pages.SwitchToPage("flows")
+	t.app.SetFocus(t.filterInput)
+}
+
+// showInterfaceDetail shows a modal with all IPs seen on an interface
+func (t *TUI) showInterfaceDetail(ifaceID uint16) {
+	stats, ok := t.interfaceStats[ifaceID]
+	if !ok {
+		return
+	}
+
+	// Check if there are any IPs
+	if len(stats.PrivateIPs) == 0 && len(stats.PrivateIPv6s) == 0 {
+		return
+	}
+
+	// Store state for live updates
+	t.ipDetailIfaceID = ifaceID
+	t.ipDetailSelected = make(map[string]bool)
+	t.ipDetailVisible = true
+
+	// Create table for IPs
+	t.ipDetailTable = tview.NewTable().
+		SetBorders(false).
+		SetSelectable(true, false)
+
+	// Initial populate
+	t.updateIPDetailTable()
+
+	// Center the modal with flexible size
+	flex := tview.NewFlex().
+		AddItem(nil, 0, 1, false).
+		AddItem(tview.NewFlex().SetDirection(tview.FlexRow).
+			AddItem(nil, 0, 1, false).
+			AddItem(t.ipDetailTable, 0, 2, true).
+			AddItem(nil, 0, 1, false), 70, 0, true).
+		AddItem(nil, 0, 1, false)
+
+	// Handle keys
+	t.ipDetailTable.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		switch event.Key() {
+		case tcell.KeyEscape:
+			t.closeIPDetail()
+			return nil
+		case tcell.KeyEnter:
+			t.applyIPDetailFilter()
+			return nil
+		case tcell.KeyRune:
+			if event.Rune() == ' ' {
+				t.toggleIPDetailSelection()
+				return nil
+			}
+		}
+		return event
+	})
+
+	t.pages.AddPage("interface-detail", flex, true, true)
+	t.app.SetFocus(t.ipDetailTable)
+}
+
+// updateIPDetailTable refreshes the IP detail table with current data
+func (t *TUI) updateIPDetailTable() {
+	if !t.ipDetailVisible || t.ipDetailTable == nil {
+		return
+	}
+
+	stats, ok := t.interfaceStats[t.ipDetailIfaceID]
+	if !ok {
+		return
+	}
+
+	// Collect all IPs
+	var allIPs []string
+	for ip := range stats.PrivateIPs {
+		allIPs = append(allIPs, ip)
+	}
+	for ip := range stats.PrivateIPv6s {
+		allIPs = append(allIPs, ip)
+	}
+	sortIPsByRange(allIPs)
+
+	// Remember selection position
+	selectedRow, _ := t.ipDetailTable.GetSelection()
+
+	// Update table
+	t.ipDetailTable.Clear()
+	t.ipDetailTable.SetBorder(true).SetTitle(fmt.Sprintf(" Interface %d - %d IPs [Space=Mark] [Enter=Filter] [Esc=Close] ", t.ipDetailIfaceID, len(allIPs)))
+
+	for i, ip := range allIPs {
+		marker := " "
+		if t.ipDetailSelected[ip] {
+			marker = "*"
+		}
+		t.ipDetailTable.SetCell(i, 0, tview.NewTableCell(marker).SetTextColor(tcell.ColorGreen))
+		t.ipDetailTable.SetCell(i, 1, tview.NewTableCell(ip).SetExpansion(1))
+	}
+
+	// Restore selection if valid
+	if selectedRow >= 0 && selectedRow < len(allIPs) {
+		t.ipDetailTable.Select(selectedRow, 0)
+	}
+}
+
+// toggleIPDetailSelection toggles selection of current IP
+func (t *TUI) toggleIPDetailSelection() {
+	if !t.ipDetailVisible || t.ipDetailTable == nil {
+		return
+	}
+
+	stats, ok := t.interfaceStats[t.ipDetailIfaceID]
+	if !ok {
+		return
+	}
+
+	// Get current IPs
+	var allIPs []string
+	for ip := range stats.PrivateIPs {
+		allIPs = append(allIPs, ip)
+	}
+	for ip := range stats.PrivateIPv6s {
+		allIPs = append(allIPs, ip)
+	}
+	sortIPsByRange(allIPs)
+
+	row, _ := t.ipDetailTable.GetSelection()
+	if row >= 0 && row < len(allIPs) {
+		ip := allIPs[row]
+		if t.ipDetailSelected[ip] {
+			delete(t.ipDetailSelected, ip)
+		} else {
+			t.ipDetailSelected[ip] = true
+		}
+		t.updateIPDetailTable()
+	}
+}
+
+// applyIPDetailFilter applies filter from selected IPs
+func (t *TUI) applyIPDetailFilter() {
+	if !t.ipDetailVisible {
+		return
+	}
+
+	stats, ok := t.interfaceStats[t.ipDetailIfaceID]
+	if !ok {
+		return
+	}
+
+	// Get current IPs
+	var allIPs []string
+	for ip := range stats.PrivateIPs {
+		allIPs = append(allIPs, ip)
+	}
+	for ip := range stats.PrivateIPv6s {
+		allIPs = append(allIPs, ip)
+	}
+	sortIPsByRange(allIPs)
+
+	var ipsToFilter []string
+	if len(t.ipDetailSelected) > 0 {
+		for ip := range t.ipDetailSelected {
+			ipsToFilter = append(ipsToFilter, ip)
+		}
+	} else {
+		// Use current row
+		row, _ := t.ipDetailTable.GetSelection()
+		if row >= 0 && row < len(allIPs) {
+			ipsToFilter = append(ipsToFilter, allIPs[row])
+		}
+	}
+
+	if len(ipsToFilter) > 0 {
+		var parts []string
+		for _, ip := range ipsToFilter {
+			parts = append(parts, fmt.Sprintf("host=%s", ip))
+		}
+		filterStr := strings.Join(parts, " || ")
+		t.filter = store.ParseFilter(filterStr)
+		t.filterInput.SetText(filterStr)
+
+		t.closeIPDetail()
+		t.currentPage = 0
+		t.pages.SwitchToPage("flows")
+		t.app.SetFocus(t.filterInput)
+	}
+}
+
+// sortIPsByRange sorts IPs by private range (10.x, 172.16.x, 192.168.x, IPv6) then numerically
+func sortIPsByRange(ips []string) {
+	sort.Slice(ips, func(i, j int) bool {
+		ipA := net.ParseIP(ips[i])
+		ipB := net.ParseIP(ips[j])
+		if ipA == nil || ipB == nil {
+			return ips[i] < ips[j]
+		}
+
+		// Get ranges (1=10.x, 2=172.16.x, 3=192.168.x, 4=ULA, 5=link-local)
+		rangeA := getPrivateRange(ipA)
+		rangeB := getPrivateRange(ipB)
+
+		// Sort by range first
+		if rangeA != rangeB {
+			return rangeA < rangeB
+		}
+
+		// Within same range, sort by bytes
+		ipA4 := ipA.To4()
+		ipB4 := ipB.To4()
+
+		if ipA4 != nil && ipB4 != nil {
+			// IPv4: compare byte by byte
+			for k := 0; k < 4; k++ {
+				if ipA4[k] != ipB4[k] {
+					return ipA4[k] < ipB4[k]
+				}
+			}
+			return false
+		}
+
+		// IPv6: compare byte by byte
+		if ipA4 == nil && ipB4 == nil {
+			for k := 0; k < 16; k++ {
+				if ipA[k] != ipB[k] {
+					return ipA[k] < ipB[k]
+				}
+			}
+			return false
+		}
+
+		// IPv4 before IPv6
+		return ipA4 != nil
+	})
+}
+
+// closeIPDetail closes the IP detail modal
+func (t *TUI) closeIPDetail() {
+	t.ipDetailVisible = false
+	t.ipDetailTable = nil
+	t.ipDetailSelected = nil
+	t.pages.RemovePage("interface-detail")
+	t.app.SetFocus(t.interfaceTable)
+}
+
 // updateDropdown updates suggestions and shows/hides dropdown
 func (t *TUI) updateDropdown(text string) {
 	t.suggestions = t.getFilterAutocomplete(text)
@@ -409,6 +1285,7 @@ func (t *TUI) getFilterAutocomplete(currentText string) []string {
 	filterFields := []string{
 		"src=", "dst=", "host=", "port:", "srcport:", "dstport:",
 		"proto=", "protocol=", "service=", "svc=", "version=",
+		"if=", "inif=", "outif=",
 		"host!=", "src!=", "dst!=", "service!=", "proto!=",
 	}
 
@@ -466,6 +1343,15 @@ func (t *TUI) getFilterAutocomplete(currentText string) []string {
 		seenIPs := t.getSeenIPs()
 		for _, ip := range seenIPs {
 			suggestions = append(suggestions, currentText+ip)
+		}
+		return suggestions
+	}
+
+	if strings.HasSuffix(trimmed, "if=") || strings.HasSuffix(trimmed, "inif=") || strings.HasSuffix(trimmed, "outif=") {
+		// Get interfaces actually seen in current flows
+		seenInterfaces := t.getSeenInterfaces()
+		for _, iface := range seenInterfaces {
+			suggestions = append(suggestions, currentText+iface)
 		}
 		return suggestions
 	}
@@ -589,6 +1475,28 @@ func (t *TUI) getSeenIPs() []string {
 		ips = ips[:15]
 	}
 	return ips
+}
+
+// getSeenInterfaces returns unique interface IDs from current flows
+func (t *TUI) getSeenInterfaces() []string {
+	seen := make(map[uint16]bool)
+	var ifaces []string
+
+	for _, flow := range t.currentFlows {
+		if flow.InputIf > 0 && !seen[flow.InputIf] {
+			seen[flow.InputIf] = true
+			ifaces = append(ifaces, fmt.Sprintf("%d", flow.InputIf))
+		}
+		if flow.OutputIf > 0 && !seen[flow.OutputIf] {
+			seen[flow.OutputIf] = true
+			ifaces = append(ifaces, fmt.Sprintf("%d", flow.OutputIf))
+		}
+	}
+
+	if len(ifaces) > 15 {
+		ifaces = ifaces[:15]
+	}
+	return ifaces
 }
 
 func (t *TUI) showFlowDetail() {
@@ -779,12 +1687,12 @@ func (t *TUI) updateStats() {
 	}
 
 	// Show filtered stats if filter is active
-	showingText := fmt.Sprintf("%d", filteredStats.Count)
+	showingText := formatNumber(filteredStats.Count)
 	if !t.filter.IsEmpty() && t.filter.IsValid() {
-		showingText = fmt.Sprintf("%d (%s, %d pkts)",
-			filteredStats.Count,
+		showingText = fmt.Sprintf("%s (%s, %s pkts)",
+			formatNumber(filteredStats.Count),
 			formatBytes(filteredStats.Bytes),
-			filteredStats.Packets)
+			formatNumber(int(filteredStats.Packets)))
 	}
 
 	// Filter error line (if any)
@@ -793,12 +1701,22 @@ func (t *TUI) updateStats() {
 		filterErrorLine = "\n[red]Filter: " + tview.Escape(t.filter.Error) + "[white]"
 	}
 
+	// Memory usage indicator
+	flowCount := t.store.GetFlowCount()
+	maxFlows := t.store.GetMaxFlows()
+	memText := fmt.Sprintf("%s/%s", formatNumber(flowCount), formatNumber(maxFlows))
+	if flowCount >= maxFlows {
+		memText = "[red]" + memText + "[white]"
+	} else if flowCount > maxFlows*80/100 {
+		memText = "[yellow]" + memText + "[white]"
+	}
+
 	text := fmt.Sprintf(
-		"[yellow]Flows:[white] %d  [yellow]Bytes:[white] %s  [yellow]Rate:[white] %.1f/s  [yellow]Throughput:[white] %s/s%s\n"+
+		"[yellow]Flows:[white] %s  [yellow]Mem:[white] %s  [yellow]Rate:[white] %s/s  [yellow]Throughput:[white] %s/s%s\n"+
 			"[yellow]Versions:[white] %s  [yellow]Exporters:[white] %d  [yellow]Showing:[white] %s%s",
-		stats.TotalFlows,
-		formatBytes(stats.TotalBytes),
-		stats.FlowsPerSecond,
+		formatNumber(int(stats.TotalFlows)),
+		memText,
+		formatDecimal(stats.FlowsPerSecond, 1),
 		formatBytes(uint64(stats.BytesPerSecond)),
 		pauseIndicator,
 		versionText,
@@ -1008,6 +1926,19 @@ func (t *TUI) refresh() {
 	t.updateStats()
 	t.updateFilterView()
 	t.updateTable()
+
+	// Always update cumulative interface stats
+	t.updateInterfaceStats()
+
+	// Update interface table display if on that page
+	if t.currentPage == 1 {
+		t.updateInterfaceTable()
+	}
+
+	// Update IP detail modal if visible
+	if t.ipDetailVisible {
+		t.updateIPDetailTable()
+	}
 }
 
 // Run starts the TUI

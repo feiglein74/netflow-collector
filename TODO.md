@@ -16,6 +16,12 @@
 
 ### Mittlere Priorität
 
+- [ ] **Firewall-Regel Korrelation**
+  - Generisches Regelwerk-Format (herstellerunabhängig)
+  - First-Match Logik wie echte Firewall
+  - Regel-Spalte in Flow-Tabelle zeigt matchende Regel
+  - Später: Importer für Cisco ACL, iptables, Palo Alto, Fortinet, Ubiquiti/UniFi, etc.
+
 - [ ] **Persistenz**
   - SQLite Backend für historische Daten
   - Flow-Archivierung mit Rotation

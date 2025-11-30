@@ -50,10 +50,12 @@ type ExprNode interface {
 
 // ConditionNode represents a single filter condition (leaf node)
 type ConditionNode struct {
-	Field   string
-	Value   string
-	Port    uint16
-	Negated bool
+	Field     string
+	Value     string
+	Port      uint16
+	Interface uint16
+	Network   *net.IPNet // For CIDR notation like 192.168.0.0/24
+	Negated   bool
 }
 
 func (c *ConditionNode) Evaluate(flow *types.Flow) bool {
@@ -63,11 +65,23 @@ func (c *ConditionNode) Evaluate(flow *types.Flow) bool {
 	var result bool
 	switch c.Field {
 	case "src", "sip", "srcip":
-		result = strings.Contains(srcIP, c.Value)
+		if c.Network != nil {
+			result = c.Network.Contains(flow.SrcAddr)
+		} else {
+			result = strings.Contains(srcIP, c.Value)
+		}
 	case "dst", "dip", "dstip":
-		result = strings.Contains(dstIP, c.Value)
+		if c.Network != nil {
+			result = c.Network.Contains(flow.DstAddr)
+		} else {
+			result = strings.Contains(dstIP, c.Value)
+		}
 	case "ip", "host":
-		result = strings.Contains(srcIP, c.Value) || strings.Contains(dstIP, c.Value)
+		if c.Network != nil {
+			result = c.Network.Contains(flow.SrcAddr) || c.Network.Contains(flow.DstAddr)
+		} else {
+			result = strings.Contains(srcIP, c.Value) || strings.Contains(dstIP, c.Value)
+		}
 	case "sport", "srcport":
 		result = flow.SrcPort == c.Port
 	case "dport", "dstport":
@@ -86,6 +100,13 @@ func (c *ConditionNode) Evaluate(flow *types.Flow) bool {
 		} else {
 			result = strings.EqualFold(srcSvc, c.Value) || strings.EqualFold(dstSvc, c.Value)
 		}
+	case "if":
+		// Match either input or output interface
+		result = flow.InputIf == c.Interface || flow.OutputIf == c.Interface
+	case "inif":
+		result = flow.InputIf == c.Interface
+	case "outif":
+		result = flow.OutputIf == c.Interface
 	default:
 		result = true
 	}
@@ -170,6 +191,7 @@ var ValidFields = map[string]bool{
 	"port": true,
 	"proto": true, "protocol": true,
 	"service": true, "svc": true,
+	"if": true, "inif": true, "outif": true,
 }
 
 // Token types for the filter parser
@@ -450,6 +472,20 @@ func (p *parser) parseCondition(s string) ExprNode {
 
 	cond := &ConditionNode{Field: key, Value: value, Negated: negated}
 
+	// Parse CIDR notation for IP fields
+	if key == "src" || key == "sip" || key == "srcip" ||
+		key == "dst" || key == "dip" || key == "dstip" ||
+		key == "ip" || key == "host" {
+		if strings.Contains(value, "/") {
+			_, network, err := net.ParseCIDR(value)
+			if err != nil {
+				p.errors = append(p.errors, s+" (invalid CIDR)")
+				return nil
+			}
+			cond.Network = network
+		}
+	}
+
 	// Parse port values
 	if key == "sport" || key == "srcport" || key == "dport" || key == "dstport" || key == "port" {
 		port, err := strconv.ParseUint(value, 10, 16)
@@ -458,6 +494,16 @@ func (p *parser) parseCondition(s string) ExprNode {
 			return nil
 		}
 		cond.Port = uint16(port)
+	}
+
+	// Parse interface values
+	if key == "if" || key == "inif" || key == "outif" {
+		iface, err := strconv.ParseUint(value, 10, 16)
+		if err != nil {
+			p.errors = append(p.errors, s+" (invalid interface)")
+			return nil
+		}
+		cond.Interface = uint16(iface)
 	}
 
 	// Validate protocol
@@ -528,12 +574,11 @@ type Stats struct {
 	UniqueExporters int
 }
 
-// FlowStore stores flows in memory with automatic expiration
+// FlowStore stores flows in memory
 type FlowStore struct {
 	mu              sync.RWMutex
 	flows           []types.Flow
 	maxFlows        int
-	retentionPeriod time.Duration
 	stats           Stats
 	exporters       map[string]bool
 	lastStatsUpdate time.Time
@@ -542,24 +587,17 @@ type FlowStore struct {
 }
 
 // New creates a new flow store
-func New(maxFlows int, retentionPeriod time.Duration) *FlowStore {
+func New(maxFlows int) *FlowStore {
 	if maxFlows == 0 {
-		maxFlows = 10000
-	}
-	if retentionPeriod == 0 {
-		retentionPeriod = 5 * time.Minute
+		maxFlows = 100000
 	}
 
 	fs := &FlowStore{
 		flows:           make([]types.Flow, 0, maxFlows),
 		maxFlows:        maxFlows,
-		retentionPeriod: retentionPeriod,
 		exporters:       make(map[string]bool),
 		lastStatsUpdate: time.Now(),
 	}
-
-	// Start cleanup goroutine
-	go fs.cleanupLoop()
 
 	return fs
 }
@@ -718,6 +756,11 @@ func (fs *FlowStore) GetFlowCount() int {
 	return len(fs.flows)
 }
 
+// GetMaxFlows returns the maximum number of flows that can be stored
+func (fs *FlowStore) GetMaxFlows() int {
+	return fs.maxFlows
+}
+
 // GetFilteredCount returns the count of flows matching a filter
 func (fs *FlowStore) GetFilteredCount(filter *Filter) int {
 	if filter == nil || filter.IsEmpty() {
@@ -759,31 +802,6 @@ func (fs *FlowStore) GetFilteredStats(filter *Filter) FilteredStats {
 	return stats
 }
 
-// cleanupLoop removes expired flows periodically
-func (fs *FlowStore) cleanupLoop() {
-	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
-
-	for range ticker.C {
-		fs.cleanup()
-	}
-}
-
-func (fs *FlowStore) cleanup() {
-	fs.mu.Lock()
-	defer fs.mu.Unlock()
-
-	cutoff := time.Now().Add(-fs.retentionPeriod)
-	newFlows := make([]types.Flow, 0, len(fs.flows))
-
-	for _, flow := range fs.flows {
-		if flow.ReceivedAt.After(cutoff) {
-			newFlows = append(newFlows, flow)
-		}
-	}
-
-	fs.flows = newFlows
-}
 
 // Clear removes all flows
 func (fs *FlowStore) Clear() {
