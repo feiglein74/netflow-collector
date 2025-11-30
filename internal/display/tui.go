@@ -73,12 +73,12 @@ type TUI struct {
 	detailView  *tview.TextView
 	filterInput *tview.InputField
 	layout      *tview.Flex
+	pages       *tview.Pages // For overlay dropdown
 
-	// Custom autocomplete dropdown
-	suggestionList    *tview.List
-	suggestions       []string
-	suggestionVisible bool
-	mainContent       *tview.Flex // Content below filter input
+	// Autocomplete dropdown overlay
+	dropdown        *tview.List
+	suggestions     []string
+	dropdownVisible bool
 
 	// State
 	filter       store.Filter
@@ -148,110 +148,65 @@ func (t *TUI) setupUI() {
 		SetFixed(1, 0)
 	t.table.SetBorder(true).SetTitle(" Flows ")
 
-	// Filter input (hidden by default)
+	// Filter input (no tview autocomplete - we use our own overlay)
 	t.filterInput = tview.NewInputField().
 		SetLabel("Filter: ").
-		SetFieldWidth(0) // Use full width
+		SetFieldWidth(0)
 
-	// Handle mouse clicks - set filterActive when focused
-	t.filterInput.SetFocusFunc(func() {
-		t.filterActive = true
-	})
-
-	// Custom suggestion list (replaces tview's broken autocomplete)
-	t.suggestionList = tview.NewList().
+	// Dropdown overlay list
+	t.dropdown = tview.NewList().
 		ShowSecondaryText(false).
 		SetHighlightFullLine(true).
 		SetSelectedBackgroundColor(tcell.ColorDarkCyan).
 		SetSelectedTextColor(tcell.ColorWhite).
 		SetMainTextColor(tcell.ColorYellow)
-	t.suggestionList.SetBorder(true).SetTitle(" Suggestions (↑↓ Tab Enter) ")
-	t.suggestionList.SetBackgroundColor(tcell.ColorBlack)
+	t.dropdown.SetBorder(true).SetTitle(" ↑↓ Navigate, Tab/Enter Select, Esc Close ")
+	t.dropdown.SetBackgroundColor(tcell.ColorBlack)
 
-	// Custom input handling for filter field
+	// Filter input key handling
 	t.filterInput.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		switch event.Key() {
-		case tcell.KeyEnter, tcell.KeyTab:
-			// If suggestions visible, accept current selection
-			if t.suggestionVisible && t.suggestionList.GetItemCount() > 0 {
-				idx := t.suggestionList.GetCurrentItem()
+		case tcell.KeyUp:
+			if t.dropdownVisible && t.dropdown.GetItemCount() > 0 {
+				idx := t.dropdown.GetCurrentItem()
+				if idx > 0 {
+					t.dropdown.SetCurrentItem(idx - 1)
+				} else {
+					t.dropdown.SetCurrentItem(t.dropdown.GetItemCount() - 1)
+				}
+				return nil
+			}
+		case tcell.KeyDown:
+			if t.dropdownVisible && t.dropdown.GetItemCount() > 0 {
+				idx := t.dropdown.GetCurrentItem()
+				if idx < t.dropdown.GetItemCount()-1 {
+					t.dropdown.SetCurrentItem(idx + 1)
+				} else {
+					t.dropdown.SetCurrentItem(0)
+				}
+				return nil
+			}
+		case tcell.KeyTab, tcell.KeyEnter:
+			if t.dropdownVisible && t.dropdown.GetItemCount() > 0 {
+				idx := t.dropdown.GetCurrentItem()
 				if idx >= 0 && idx < len(t.suggestions) {
 					t.filterInput.SetText(t.suggestions[idx])
-					t.hideSuggestions()
 				}
+				t.hideDropdown()
 				return nil
 			}
-			// Tab without suggestions does nothing
-			if event.Key() == tcell.KeyTab {
-				return nil
-			}
-			// Enter applies filter
-			value := strings.TrimSpace(t.filterInput.GetText())
-			t.filter = store.ParseFilter(value)
-
-			// Add to history if non-empty and different from last
-			if value != "" {
-				if len(t.filterHistory) == 0 || t.filterHistory[0] != value {
-					t.filterHistory = append([]string{value}, t.filterHistory...)
-					if len(t.filterHistory) > 50 {
-						t.filterHistory = t.filterHistory[:50]
-					}
-					saveFilterHistory(t.filterHistory)
-				}
-			}
-
-			t.hideSuggestions()
-			t.filterActive = false
-			t.app.SetFocus(t.table)
-			return nil
-
 		case tcell.KeyEscape:
-			if t.suggestionVisible {
-				t.hideSuggestions()
+			if t.dropdownVisible {
+				t.hideDropdown()
 				return nil
 			}
-			t.filterActive = false
-			t.app.SetFocus(t.table)
-			return nil
-
-		case tcell.KeyUp:
-			if t.suggestionVisible && t.suggestionList.GetItemCount() > 0 {
-				// Navigate up in suggestions
-				idx := t.suggestionList.GetCurrentItem()
-				if idx > 0 {
-					t.suggestionList.SetCurrentItem(idx - 1)
-				} else {
-					// Wrap to bottom
-					t.suggestionList.SetCurrentItem(t.suggestionList.GetItemCount() - 1)
-				}
-				return nil
-			}
-			// No suggestions: browse history
-			t.navigateFilterHistory(1)
-			return nil
-
-		case tcell.KeyDown:
-			if t.suggestionVisible && t.suggestionList.GetItemCount() > 0 {
-				// Navigate down in suggestions
-				idx := t.suggestionList.GetCurrentItem()
-				if idx < t.suggestionList.GetItemCount()-1 {
-					t.suggestionList.SetCurrentItem(idx + 1)
-				} else {
-					// Wrap to top
-					t.suggestionList.SetCurrentItem(0)
-				}
-				return nil
-			}
-			// No suggestions: browse history
-			t.navigateFilterHistory(-1)
-			return nil
 		}
 		return event
 	})
 
-	// Update suggestions when text changes
+	// Update dropdown when text changes
 	t.filterInput.SetChangedFunc(func(text string) {
-		t.updateSuggestions(text)
+		t.updateDropdown(text)
 	})
 
 	// Help view
@@ -268,7 +223,7 @@ func (t *TUI) setupUI() {
 	t.detailView.SetBorder(true).SetTitle(" Flow Details (Esc to close) ")
 
 	// Filter input at top (with border for visibility)
-	t.filterInput.SetBorder(true).SetTitle(" Filter (Enter=apply, Esc=cancel, ↑↓=history) ")
+	t.filterInput.SetBorder(true).SetTitle(" Filter (↑↓ suggestions, Enter apply) ")
 	t.filterInput.SetBackgroundColor(tcell.ColorBlack)
 	t.filterInput.SetFieldBackgroundColor(tcell.ColorDarkBlue)
 
@@ -277,26 +232,31 @@ func (t *TUI) setupUI() {
 		AddItem(t.statsView, 0, 2, false).
 		AddItem(t.filterView, 0, 1, false)
 
-	// Main content (everything below filter input)
-	t.mainContent = tview.NewFlex().SetDirection(tview.FlexRow).
-		AddItem(topRow, 7, 0, false).
-		AddItem(t.table, 0, 1, true)
-
-	// Main layout - filterInput at top
+	// Main layout
 	t.layout = tview.NewFlex().SetDirection(tview.FlexRow).
-		AddItem(t.filterInput, 3, 0, false).
-		AddItem(t.mainContent, 0, 1, true)
+		AddItem(t.filterInput, 3, 0, true).
+		AddItem(topRow, 7, 0, false).
+		AddItem(t.table, 0, 1, false)
+
+	// Pages for overlay support
+	t.pages = tview.NewPages().
+		AddPage("main", t.layout, true, true)
 
 	// Setup table headers
 	t.setupTableHeaders()
 
-	// Setup key bindings
-	t.setupKeyBindings()
+	// Only Ctrl+C to quit - no other key bindings (for now)
+	t.app.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		if event.Key() == tcell.KeyCtrlC {
+			t.app.Stop()
+			return nil
+		}
+		return event
+	})
 
-	// Enable mouse support
-	t.app.EnableMouse(true)
-
-	t.app.SetRoot(t.layout, true)
+	t.app.EnableMouse(false)
+	t.app.SetRoot(t.pages, true)
+	t.app.SetFocus(t.filterInput)
 }
 
 // columnDef defines a table column with minimum width
@@ -376,183 +336,58 @@ func (t *TUI) setupTableHeaders() {
 	}
 }
 
-func (t *TUI) setupKeyBindings() {
-	t.app.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
-		// If filter input is active, let the InputField handle all keys
-		if t.filterActive {
-			return event
-		}
-
-		switch event.Key() {
-		case tcell.KeyEscape:
-			if t.showDetail {
-				t.hideFlowDetail()
-				return nil
-			}
-			if t.showHelp {
-				t.toggleHelp()
-				return nil
-			}
-			t.clearFilter()
-			return nil
-		case tcell.KeyEnter:
-			if !t.showHelp && !t.showDetail {
-				t.showFlowDetail()
-				return nil
-			}
-			return nil
-		case tcell.KeyCtrlC:
-			t.app.Stop()
-			return nil
-		}
-
-		switch event.Rune() {
-		case 'q', 'Q':
-			t.app.Stop()
-			return nil
-		case '?':
-			t.toggleHelp()
-			return nil
-		case ' ':
-			t.paused = !t.paused
-			return nil
-		case 'c', 'C':
-			t.clearFilter()
-			return nil
-
-		// Sorting
-		case '1':
-			t.setSortField(store.SortByTime)
-		case '2':
-			t.setSortField(store.SortByBytes)
-		case '3':
-			t.setSortField(store.SortByPackets)
-		case '4':
-			t.setSortField(store.SortBySrcIP)
-		case '5':
-			t.setSortField(store.SortByDstIP)
-		case '6':
-			t.setSortField(store.SortByProtocol)
-		case 'r', 'R':
-			t.sortAsc = !t.sortAsc
-
-		// Filter - single filter input like Wireshark
-		case 'f', 'F', '/':
-			t.startFilterInput()
-			return nil
-
-		// Toggle columns
-		case 'v', 'V':
-			t.showVersion = !t.showVersion
-			t.resetColWidths() // Reset high water marks when column count changes
-			t.setupTableHeaders()
-			return nil
-		case 'n', 'N':
-			t.showDNS = !t.showDNS
-			return nil
-		case 'e', 'E':
-			t.showService = !t.showService
-			t.setupTableHeaders() // Update header name Proto/Service
-			return nil
-		}
-
-		return event
-	})
-}
-
-func (t *TUI) startFilterInput() {
-	t.filterActive = true
-	t.historyIndex = -1 // Start with new input
-	t.filterInput.SetLabel("Filter: ")
-	t.filterInput.SetText(t.filter.String())
-	t.app.SetFocus(t.filterInput)
-}
-
-// navigateFilterHistory moves through filter history
-func (t *TUI) navigateFilterHistory(direction int) {
-	if len(t.filterHistory) == 0 {
-		return
-	}
-
-	newIndex := t.historyIndex + direction
-	if newIndex < -1 {
-		newIndex = -1
-	}
-	if newIndex >= len(t.filterHistory) {
-		newIndex = len(t.filterHistory) - 1
-	}
-
-	t.historyIndex = newIndex
-	if t.historyIndex == -1 {
-		t.filterInput.SetText("")
-	} else {
-		// History is stored newest-first, so index 0 is most recent
-		t.filterInput.SetText(t.filterHistory[t.historyIndex])
-	}
-}
-
-// updateSuggestions updates the suggestion list based on current input
-func (t *TUI) updateSuggestions(text string) {
-	t.suggestions = t.getFilterAutocomplete(text)
-	if len(t.suggestions) > 0 {
-		t.showSuggestions()
-	} else {
-		t.hideSuggestions()
-	}
-}
-
-// showSuggestions displays the suggestion dropdown
-func (t *TUI) showSuggestions() {
-	if t.suggestionVisible {
-		// Just update the list content
-		t.suggestionList.Clear()
-		for _, s := range t.suggestions {
-			t.suggestionList.AddItem(s, "", 0, nil)
-		}
-		return
-	}
-
-	t.suggestionVisible = true
-	t.suggestionList.Clear()
-	for _, s := range t.suggestions {
-		t.suggestionList.AddItem(s, "", 0, nil)
-	}
-	t.suggestionList.SetCurrentItem(0)
-
-	// Rebuild main content with suggestion list
-	t.rebuildMainContent(true)
-}
-
-// hideSuggestions hides the suggestion dropdown
-func (t *TUI) hideSuggestions() {
-	if !t.suggestionVisible {
-		return
-	}
-	t.suggestionVisible = false
-	t.rebuildMainContent(false)
-}
-
-// rebuildMainContent rebuilds the main content area
-func (t *TUI) rebuildMainContent(withSuggestions bool) {
-	topRow := tview.NewFlex().
-		AddItem(t.statsView, 0, 2, false).
-		AddItem(t.filterView, 0, 1, false)
-
-	t.mainContent.Clear()
-	if withSuggestions {
-		// Calculate suggestion list height (max 8 items + border)
-		listHeight := len(t.suggestions) + 2
-		if listHeight > 10 {
-			listHeight = 10
-		}
-		t.mainContent.AddItem(t.suggestionList, listHeight, 0, false)
-	}
-	t.mainContent.AddItem(topRow, 7, 0, false)
-	t.mainContent.AddItem(t.table, 0, 1, true)
-}
-
 func (t *TUI) clearFilter() {
 	t.filter = store.Filter{}
+}
+
+// updateDropdown updates suggestions and shows/hides dropdown
+func (t *TUI) updateDropdown(text string) {
+	t.suggestions = t.getFilterAutocomplete(text)
+	if len(t.suggestions) > 0 {
+		t.showDropdown()
+	} else {
+		t.hideDropdown()
+	}
+}
+
+// showDropdown displays the dropdown overlay
+func (t *TUI) showDropdown() {
+	t.dropdown.Clear()
+	for _, s := range t.suggestions {
+		t.dropdown.AddItem(s, "", 0, nil)
+	}
+	t.dropdown.SetCurrentItem(0)
+
+	if !t.dropdownVisible {
+		t.dropdownVisible = true
+		// Create a modal-like overlay positioned below filter input
+		// Height: number of items + 2 for border, max 10
+		height := len(t.suggestions) + 2
+		if height > 10 {
+			height = 10
+		}
+
+		// Dropdown overlay: positioned at top, under the filter input (row 3)
+		// Using a Flex to position it
+		dropdownContainer := tview.NewFlex().SetDirection(tview.FlexRow).
+			AddItem(nil, 3, 0, false).              // Spacer for filter input height
+			AddItem(t.dropdown, height, 0, false). // The dropdown
+			AddItem(nil, 0, 1, false)              // Rest of space
+
+		t.pages.AddPage("dropdown", dropdownContainer, true, true)
+	} else {
+		// Just update content, already visible
+	}
+	t.app.SetFocus(t.filterInput) // Keep focus on input
+}
+
+// hideDropdown hides the dropdown overlay
+func (t *TUI) hideDropdown() {
+	if t.dropdownVisible {
+		t.dropdownVisible = false
+		t.pages.RemovePage("dropdown")
+		t.app.SetFocus(t.filterInput)
+	}
 }
 
 // getFilterAutocomplete returns autocomplete suggestions based on current input
@@ -823,10 +658,13 @@ func (t *TUI) showFlowDetail() {
 func (t *TUI) hideFlowDetail() {
 	t.showDetail = false
 	t.layout.Clear()
-	t.rebuildMainContent(false)
-	t.layout.AddItem(t.filterInput, 3, 0, false)
-	t.layout.AddItem(t.mainContent, 0, 1, true)
-	t.app.SetFocus(t.table)
+	topRow := tview.NewFlex().
+		AddItem(t.statsView, 0, 2, false).
+		AddItem(t.filterView, 0, 1, false)
+	t.layout.AddItem(t.filterInput, 3, 0, true)
+	t.layout.AddItem(topRow, 7, 0, false)
+	t.layout.AddItem(t.table, 0, 1, false)
+	t.app.SetFocus(t.filterInput)
 }
 
 func (t *TUI) setSortField(field store.SortField) {
@@ -845,10 +683,13 @@ func (t *TUI) toggleHelp() {
 		t.layout.AddItem(t.helpView, 0, 1, true)
 	} else {
 		t.layout.Clear()
-		t.rebuildMainContent(false)
-		t.layout.AddItem(t.filterInput, 3, 0, false)
-		t.layout.AddItem(t.mainContent, 0, 1, true)
-		t.app.SetFocus(t.table)
+		topRow := tview.NewFlex().
+			AddItem(t.statsView, 0, 2, false).
+			AddItem(t.filterView, 0, 1, false)
+		t.layout.AddItem(t.filterInput, 3, 0, true)
+		t.layout.AddItem(topRow, 7, 0, false)
+		t.layout.AddItem(t.table, 0, 1, false)
+		t.app.SetFocus(t.filterInput)
 	}
 }
 
