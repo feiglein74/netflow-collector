@@ -32,7 +32,7 @@ Das Format basiert auf [Keep a Changelog](https://keepachangelog.com/de/1.0.0/).
 
 - **Filter-Erweiterungen**
   - Interface-Filter: `if=`, `inif=`, `outif=`
-  - CIDR-Notation: `host=192.168.0.0/24`
+  - CIDR-Notation: `ip=192.168.0.0/24`
 
 - **UI Verbesserungen**
   - Custom Autocomplete-Dropdown (ersetzt tview built-in)

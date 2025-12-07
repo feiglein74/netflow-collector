@@ -1,6 +1,7 @@
 package store
 
 import (
+	"fmt"
 	"net"
 	"sort"
 	"strconv"
@@ -76,7 +77,7 @@ func (c *ConditionNode) Evaluate(flow *types.Flow) bool {
 		} else {
 			result = strings.Contains(dstIP, c.Value)
 		}
-	case "ip", "host":
+	case "ip":
 		if c.Network != nil {
 			result = c.Network.Contains(flow.SrcAddr) || c.Network.Contains(flow.DstAddr)
 		} else {
@@ -185,7 +186,7 @@ func (f *Filter) Matches(flow *types.Flow) bool {
 var ValidFields = map[string]bool{
 	"src": true, "sip": true, "srcip": true,
 	"dst": true, "dip": true, "dstip": true,
-	"ip": true, "host": true,
+	"ip": true,
 	"sport": true, "srcport": true,
 	"dport": true, "dstport": true,
 	"port": true,
@@ -434,6 +435,12 @@ func (p *parser) parsePrimaryExpr() ExprNode {
 	return nil
 }
 
+// Known protocols for implicit detection
+var knownProtocols = map[string]bool{
+	"tcp": true, "udp": true, "icmp": true, "gre": true,
+	"esp": true, "ah": true, "icmpv6": true, "sctp": true,
+}
+
 // parseCondition parses a single field=value condition
 func (p *parser) parseCondition(s string) ExprNode {
 	var key, value string
@@ -451,11 +458,25 @@ func (p *parser) parseCondition(s string) ExprNode {
 			idx = strings.Index(s, ":")
 		}
 		if idx <= 0 {
-			p.errors = append(p.errors, s+" (invalid syntax)")
-			return nil
+			// No operator found - try implicit detection
+			lowerS := strings.ToLower(s)
+
+			// Check if it's a known protocol
+			if knownProtocols[lowerS] {
+				key = "proto"
+				value = lowerS
+			} else if resolver.IsKnownService(lowerS) {
+				// Check if it's a known service
+				key = "service"
+				value = lowerS
+			} else {
+				p.errors = append(p.errors, s+" (invalid syntax)")
+				return nil
+			}
+		} else {
+			key = strings.ToLower(s[:idx])
+			value = s[idx+1:]
 		}
-		key = strings.ToLower(s[:idx])
-		value = s[idx+1:]
 	}
 
 	// Validate field name
@@ -475,7 +496,7 @@ func (p *parser) parseCondition(s string) ExprNode {
 	// Parse CIDR notation for IP fields
 	if key == "src" || key == "sip" || key == "srcip" ||
 		key == "dst" || key == "dip" || key == "dstip" ||
-		key == "ip" || key == "host" {
+		key == "ip" {
 		if strings.Contains(value, "/") {
 			_, network, err := net.ParseCIDR(value)
 			if err != nil {
@@ -1024,4 +1045,199 @@ func (fs *FlowStore) MarkFlowsAccessed(flowKeys []string) {
 			}
 		}
 	}
+}
+
+// QueryAggregatedFlows returns flows aggregated by 5-tuple (src, dst, sport, dport, proto)
+// Multiple flow exports for the same connection are merged into one entry
+func (fs *FlowStore) QueryAggregatedFlows(filter *Filter, sortBy SortField, ascending bool, limit int) []types.Flow {
+	fs.mu.RLock()
+	defer fs.mu.RUnlock()
+
+	// Group flows by FlowKey (5-tuple)
+	flowMap := make(map[string]*types.Flow)
+
+	for i := range fs.flows {
+		flow := &fs.flows[i]
+
+		// Apply filter
+		if filter != nil && !filter.IsEmpty() && !filter.Matches(flow) {
+			continue
+		}
+
+		key := flow.FlowKey()
+		if existing, ok := flowMap[key]; ok {
+			// Aggregate: sum bytes and packets
+			existing.Bytes += flow.Bytes
+			existing.Packets += flow.Packets
+			// Keep earliest StartTime
+			if flow.StartTime.Before(existing.StartTime) {
+				existing.StartTime = flow.StartTime
+			}
+			// Keep latest EndTime
+			if flow.EndTime.After(existing.EndTime) {
+				existing.EndTime = flow.EndTime
+			}
+			// Keep latest ReceivedAt (for sorting by time)
+			if flow.ReceivedAt.After(existing.ReceivedAt) {
+				existing.ReceivedAt = flow.ReceivedAt
+			}
+			// Keep latest LastAccessed
+			if flow.LastAccessed.After(existing.LastAccessed) {
+				existing.LastAccessed = flow.LastAccessed
+			}
+		} else {
+			// First occurrence - create copy
+			flowCopy := *flow
+			flowMap[key] = &flowCopy
+		}
+	}
+
+	// Convert map to slice
+	flows := make([]types.Flow, 0, len(flowMap))
+	for _, flow := range flowMap {
+		flows = append(flows, *flow)
+	}
+
+	// Sort flows
+	sort.Slice(flows, func(i, j int) bool {
+		var less bool
+		switch sortBy {
+		case SortByTime:
+			less = flows[i].ReceivedAt.Before(flows[j].ReceivedAt)
+		case SortByBytes:
+			less = flows[i].Bytes < flows[j].Bytes
+		case SortByPackets:
+			less = flows[i].Packets < flows[j].Packets
+		case SortBySrcIP:
+			less = compareIPs(flows[i].SrcAddr, flows[j].SrcAddr) < 0
+		case SortByDstIP:
+			less = compareIPs(flows[i].DstAddr, flows[j].DstAddr) < 0
+		case SortByProtocol:
+			less = flows[i].Protocol < flows[j].Protocol
+		default:
+			less = flows[i].ReceivedAt.Before(flows[j].ReceivedAt)
+		}
+		if ascending {
+			return less
+		}
+		return !less
+	})
+
+	// Limit results
+	if limit > 0 && limit < len(flows) {
+		flows = flows[:limit]
+	}
+
+	return flows
+}
+
+// QueryConversations groups flows into bidirectional conversations
+func (fs *FlowStore) QueryConversations(filter *Filter, sortBy SortField, ascending bool, limit int) []types.Conversation {
+	fs.mu.RLock()
+	defer fs.mu.RUnlock()
+
+	// Group flows by conversation key
+	convMap := make(map[string]*types.Conversation)
+
+	for i := range fs.flows {
+		flow := &fs.flows[i]
+
+		// Apply filter
+		if filter != nil && !filter.IsEmpty() && !filter.Matches(flow) {
+			continue
+		}
+
+		key := flow.ConversationKey()
+		conv, exists := convMap[key]
+
+		if !exists {
+			// Determine A and B endpoints (A is lexicographically smaller)
+			src := fmt.Sprintf("%s:%d", flow.SrcAddr, flow.SrcPort)
+			dst := fmt.Sprintf("%s:%d", flow.DstAddr, flow.DstPort)
+
+			conv = &types.Conversation{
+				Protocol:   flow.Protocol,
+				FirstSeen:  flow.ReceivedAt,
+				LastSeen:   flow.ReceivedAt,
+				InputIf:    flow.InputIf,
+				OutputIf:   flow.OutputIf,
+				ExporterIP: flow.ExporterIP,
+			}
+
+			if src < dst {
+				conv.AddrA = flow.SrcAddr
+				conv.PortA = flow.SrcPort
+				conv.AddrB = flow.DstAddr
+				conv.PortB = flow.DstPort
+			} else {
+				conv.AddrA = flow.DstAddr
+				conv.PortA = flow.DstPort
+				conv.AddrB = flow.SrcAddr
+				conv.PortB = flow.SrcPort
+			}
+			convMap[key] = conv
+		}
+
+		// Determine direction and aggregate
+		src := fmt.Sprintf("%s:%d", flow.SrcAddr, flow.SrcPort)
+		convA := fmt.Sprintf("%s:%d", conv.AddrA, conv.PortA)
+
+		if src == convA {
+			// A -> B direction
+			conv.BytesAtoB += flow.Bytes
+			conv.PacketsAtoB += flow.Packets
+			conv.FlowsAtoB++
+		} else {
+			// B -> A direction
+			conv.BytesBtoA += flow.Bytes
+			conv.PacketsBtoA += flow.Packets
+			conv.FlowsBtoA++
+		}
+
+		// Update timing
+		if flow.ReceivedAt.Before(conv.FirstSeen) {
+			conv.FirstSeen = flow.ReceivedAt
+		}
+		if flow.ReceivedAt.After(conv.LastSeen) {
+			conv.LastSeen = flow.ReceivedAt
+		}
+	}
+
+	// Convert map to slice
+	conversations := make([]types.Conversation, 0, len(convMap))
+	for _, conv := range convMap {
+		conversations = append(conversations, *conv)
+	}
+
+	// Sort conversations
+	sort.Slice(conversations, func(i, j int) bool {
+		var less bool
+		switch sortBy {
+		case SortByTime:
+			less = conversations[i].LastSeen.Before(conversations[j].LastSeen)
+		case SortByBytes:
+			less = conversations[i].TotalBytes() < conversations[j].TotalBytes()
+		case SortByPackets:
+			less = conversations[i].TotalPackets() < conversations[j].TotalPackets()
+		case SortBySrcIP:
+			less = compareIPs(conversations[i].AddrA, conversations[j].AddrA) < 0
+		case SortByDstIP:
+			less = compareIPs(conversations[i].AddrB, conversations[j].AddrB) < 0
+		case SortByProtocol:
+			less = conversations[i].Protocol < conversations[j].Protocol
+		default:
+			less = conversations[i].LastSeen.Before(conversations[j].LastSeen)
+		}
+		if ascending {
+			return less
+		}
+		return !less
+	})
+
+	// Limit results
+	if limit > 0 && limit < len(conversations) {
+		conversations = conversations[:limit]
+	}
+
+	return conversations
 }

@@ -40,6 +40,26 @@ func GetServiceByPort(port uint16) string {
 	return ""
 }
 
+// IsKnownService checks if a string is a known service name
+func IsKnownService(name string) bool {
+	for _, svc := range commonServices {
+		if svc == name {
+			return true
+		}
+	}
+	for _, svc := range tcpServices {
+		if svc == name {
+			return true
+		}
+	}
+	for _, svc := range udpServices {
+		if svc == name {
+			return true
+		}
+	}
+	return false
+}
+
 // Common services (same port for TCP and UDP)
 var commonServices = map[uint16]string{
 	7:     "echo",
@@ -154,6 +174,7 @@ var commonServices = map[uint16]string{
 	9200:  "elasticsearch",
 	9300:  "elasticsearch",
 	9418:  "git",
+	9993:  "zerotier",
 	9999:  "abyss",
 	10000: "webmin",
 	10050: "zabbix-agent",
@@ -168,6 +189,7 @@ var commonServices = map[uint16]string{
 	27018: "mongodb",
 	28015: "rethinkdb",
 	32400: "plex",
+	49000: "tr-064",
 	50000: "sap",
 	51413: "bittorrent",
 }

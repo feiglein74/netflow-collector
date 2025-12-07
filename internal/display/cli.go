@@ -281,70 +281,7 @@ func (c *CLI) renderFooter(width int) {
 		time.Now().Format("15:04:05"), width)
 }
 
-// formatBytes formats bytes in human-readable form
-func formatBytes(b uint64) string {
-	const unit = 1024
-	if b < unit {
-		return fmt.Sprintf("%d B", b)
-	}
-	div, exp := uint64(unit), 0
-	for n := b / unit; n >= unit; n /= unit {
-		div *= unit
-		exp++
-	}
-	return fmt.Sprintf("%s %cB", formatDecimal(float64(b)/float64(div), 1), "KMGTPE"[exp])
-}
-
-// Locale-aware number formatting
-var (
-	thousandSep = "."
-	decimalSep  = ","
-)
-
-func init() {
-	// Detect locale from environment
-	locale := os.Getenv("LC_NUMERIC")
-	if locale == "" {
-		locale = os.Getenv("LC_ALL")
-	}
-	if locale == "" {
-		locale = os.Getenv("LANG")
-	}
-
-	// English locales use comma for thousands, dot for decimal
-	if strings.HasPrefix(locale, "en") || strings.HasPrefix(locale, "C") {
-		thousandSep = ","
-		decimalSep = "."
-	}
-	// German, most European locales use dot for thousands, comma for decimal (default)
-}
-
-// formatNumber formats a number with thousand separators
-func formatNumber(n int) string {
-	if n < 0 {
-		return "-" + formatNumber(-n)
-	}
-	str := fmt.Sprintf("%d", n)
-	if len(str) <= 3 {
-		return str
-	}
-
-	var result []byte
-	for i, c := range str {
-		if i > 0 && (len(str)-i)%3 == 0 {
-			result = append(result, thousandSep[0])
-		}
-		result = append(result, byte(c))
-	}
-	return string(result)
-}
-
-// formatDecimal formats a float with locale-aware decimal separator
-func formatDecimal(f float64, precision int) string {
-	format := fmt.Sprintf("%%.%df", precision)
-	str := fmt.Sprintf(format, f)
-	return strings.Replace(str, ".", decimalSep, 1)
-}
+// NOTE: formatBytes, formatNumber, formatDecimal are defined in tui_helpers.go
 
 // formatEndpoint formats IP:port
 func formatEndpoint(ip string, port uint16) string {

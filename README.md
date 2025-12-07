@@ -114,7 +114,7 @@ port:443
 proto=tcp
 
 # CIDR-Notation für Subnetze
-host=10.0.0.0/8
+ip=10.0.0.0/8
 src=192.168.0.0/16
 dst=172.16.0.0/12
 
@@ -124,7 +124,7 @@ inif=2                  # Nur Input-Interface
 outif=3                 # Nur Output-Interface
 
 # Kombinierte Filter
-if=4 && host=192.168.0.0/16
+if=4 && ip=192.168.0.0/16
 inif=2 && proto=tcp
 
 # Logische Operatoren
@@ -134,10 +134,10 @@ port:80 || port:443
 
 # Gruppierung mit Klammern
 !(src=10.0.0.251 && port:53)
-(proto=tcp || proto=udp) && host=10.0.0.1
+(proto=tcp || proto=udp) && ip=10.0.0.1
 
 # Negation
-host!=10.0.0.251
+ip!=10.0.0.251
 service!=dns
 ```
 
@@ -147,7 +147,7 @@ service!=dns
 |------|---------|--------------|
 | `src` | `srcip`, `source` | Source IP (CIDR supported) |
 | `dst` | `dstip`, `dest` | Destination IP (CIDR supported) |
-| `host` | `ip` | Source oder Destination IP (CIDR supported) |
+| `ip` | - | Source oder Destination IP (CIDR supported) |
 | `srcport` | `sport` | Source Port |
 | `dstport` | `dport` | Destination Port |
 | `port` | - | Source oder Destination Port |

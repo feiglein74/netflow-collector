@@ -127,3 +127,90 @@ func (f *Flow) FlowKey() string {
 		f.DstAddr, f.DstPort,
 		f.Protocol)
 }
+
+// ConversationKey generates a bidirectional key (same for both directions)
+func (f *Flow) ConversationKey() string {
+	// Normalize: smaller IP:port first
+	src := fmt.Sprintf("%s:%d", f.SrcAddr, f.SrcPort)
+	dst := fmt.Sprintf("%s:%d", f.DstAddr, f.DstPort)
+	if src < dst {
+		return fmt.Sprintf("%s-%s-%d", src, dst, f.Protocol)
+	}
+	return fmt.Sprintf("%s-%s-%d", dst, src, f.Protocol)
+}
+
+// Conversation represents a bidirectional flow (request + response)
+type Conversation struct {
+	// Endpoint A (the "smaller" IP:port lexicographically)
+	AddrA    net.IP
+	PortA    uint16
+	// Endpoint B
+	AddrB    net.IP
+	PortB    uint16
+	Protocol uint8
+
+	// Forward direction (A -> B)
+	BytesAtoB   uint64
+	PacketsAtoB uint64
+	FlowsAtoB   int
+
+	// Reverse direction (B -> A)
+	BytesBtoA   uint64
+	PacketsBtoA uint64
+	FlowsBtoA   int
+
+	// Aggregated timing
+	FirstSeen time.Time
+	LastSeen  time.Time
+
+	// For display
+	InputIf    uint16
+	OutputIf   uint16
+	ExporterIP net.IP
+}
+
+// TotalBytes returns total bytes in both directions
+func (c *Conversation) TotalBytes() uint64 {
+	return c.BytesAtoB + c.BytesBtoA
+}
+
+// TotalPackets returns total packets in both directions
+func (c *Conversation) TotalPackets() uint64 {
+	return c.PacketsAtoB + c.PacketsBtoA
+}
+
+// IsBidirectional returns true if traffic exists in both directions
+func (c *Conversation) IsBidirectional() bool {
+	return c.FlowsAtoB > 0 && c.FlowsBtoA > 0
+}
+
+// ProtocolName returns the human-readable protocol name
+func (c *Conversation) ProtocolName() string {
+	switch c.Protocol {
+	case 1:
+		return "ICMP"
+	case 6:
+		return "TCP"
+	case 17:
+		return "UDP"
+	case 47:
+		return "GRE"
+	case 50:
+		return "ESP"
+	case 51:
+		return "AH"
+	case 58:
+		return "ICMPv6"
+	case 89:
+		return "OSPF"
+	case 132:
+		return "SCTP"
+	default:
+		return fmt.Sprintf("%d", c.Protocol)
+	}
+}
+
+// Key returns a unique identifier for this conversation
+func (c *Conversation) Key() string {
+	return fmt.Sprintf("%s:%d-%s:%d-%d", c.AddrA, c.PortA, c.AddrB, c.PortB, c.Protocol)
+}
