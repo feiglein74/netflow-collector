@@ -183,10 +183,21 @@ func (t *TUI) updateTableFlows() {
 			protoDisplay = service
 		}
 
+		// Determine colors based on internal/external IP
+		// Internal = private IP OR learned IPv6 prefix (seen as source on input interface)
+		srcColor := tcell.ColorOrange // public/external
+		if flow.SrcAddr != nil && t.isInternalIP(flow.SrcAddr) {
+			srcColor = tcell.ColorGreen // private/internal
+		}
+		dstColor := tcell.ColorOrange // public/external
+		if flow.DstAddr != nil && t.isInternalIP(flow.DstAddr) {
+			dstColor = tcell.ColorGreen // private/internal
+		}
+
 		col := 0
-		t.table.SetCell(row, col, tview.NewTableCell(formatCol(src, col, cols[col], true)).SetExpansion(1))
+		t.table.SetCell(row, col, tview.NewTableCell(formatCol(src, col, cols[col], true)).SetTextColor(srcColor).SetExpansion(1))
 		col++
-		t.table.SetCell(row, col, tview.NewTableCell(formatCol(dst, col, cols[col], true)).SetExpansion(1))
+		t.table.SetCell(row, col, tview.NewTableCell(formatCol(dst, col, cols[col], true)).SetTextColor(dstColor).SetExpansion(1))
 		col++
 		t.table.SetCell(row, col, tview.NewTableCell(formatCol(protoDisplay, col, cols[col], false)).SetTextColor(protoColor).SetExpansion(1))
 		col++
@@ -207,16 +218,33 @@ func (t *TUI) updateTableFlows() {
 	}
 }
 
-// formatFlowEndpoint formats IP:port with optional DNS resolution
+// formatFlowEndpoint formats IP:port with optional DNS resolution and color coding
 func (t *TUI) formatFlowEndpoint(ip string, port uint16, protocol uint8) string {
 	display := ip
 
-	// Try DNS resolution if enabled
-	if t.showDNS {
+	// Try DNS resolution if enabled (any mode except Off)
+	if t.dnsMode != DNSModeOff {
 		parsedIP := parseIP(ip)
 		if parsedIP != nil {
-			if hostname, ok := t.resolver.GetCached(parsedIP); ok {
-				display = hostname
+			hostname, source, found := t.resolver.GetCachedWithSource(parsedIP)
+			if found {
+				// Check if source matches current display mode
+				showThis := false
+				switch t.dnsMode {
+				case DNSModeAll:
+					showThis = true
+				case DNSModeReverse:
+					showThis = (source == resolver.SourceReverse)
+				case DNSModeTechnitium:
+					showThis = (source == resolver.SourceTechnitium)
+				case DNSModeMDNS:
+					showThis = (source == resolver.SourceMDNS)
+				}
+
+				if showThis {
+					// Apply color based on source
+					display = t.colorizeHostname(hostname, source)
+				}
 			} else {
 				// Trigger async lookup for next refresh
 				t.resolver.Resolve(parsedIP)
@@ -229,6 +257,22 @@ func (t *TUI) formatFlowEndpoint(ip string, port uint16, protocol uint8) string 
 	}
 
 	return fmt.Sprintf("%s:%d", display, port)
+}
+
+// colorizeHostname applies color to hostname based on DNS source
+func (t *TUI) colorizeHostname(hostname string, source resolver.DNSSource) string {
+	switch source {
+	case resolver.SourceReverse:
+		return fmt.Sprintf("[#00BFFF]%s[white]", hostname) // DeepSkyBlue
+	case resolver.SourceTechnitium:
+		return fmt.Sprintf("[#FF8C00]%s[white]", hostname) // DarkOrange
+	case resolver.SourceMDNS:
+		return fmt.Sprintf("[#9370DB]%s[white]", hostname) // MediumPurple
+	case resolver.SourceMAC:
+		return fmt.Sprintf("[#20B2AA]%s[white]", hostname) // LightSeaGreen
+	default:
+		return hostname
+	}
 }
 
 // getSeenServices returns unique service names from current flows

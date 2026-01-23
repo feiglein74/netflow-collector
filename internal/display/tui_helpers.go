@@ -3,6 +3,8 @@ package display
 import (
 	"fmt"
 	"net"
+	"os/exec"
+	"runtime"
 	"sort"
 	"strings"
 	"time"
@@ -337,6 +339,65 @@ func commonPrefixBitsV6(a, b net.IP) int {
 	return bits
 }
 
+// getIPv6Prefix64 extracts the /64 prefix from an IPv6 address as a string
+// Returns empty string for IPv4 or invalid addresses
+func getIPv6Prefix64(ip net.IP) string {
+	return getIPv6PrefixN(ip, 64)
+}
+
+// getIPv6PrefixN extracts a prefix of given length from an IPv6 address
+func getIPv6PrefixN(ip net.IP, prefixLen int) string {
+	if ip == nil || prefixLen < 0 || prefixLen > 128 {
+		return ""
+	}
+	// Make sure it's IPv6 (not IPv4-mapped)
+	if ip.To4() != nil {
+		return ""
+	}
+	// Ensure 16-byte representation
+	if len(ip) != 16 {
+		ip = ip.To16()
+		if ip == nil {
+			return ""
+		}
+	}
+
+	// Create network mask and apply it
+	mask := net.CIDRMask(prefixLen, 128)
+	network := ip.Mask(mask)
+
+	return fmt.Sprintf("%s/%d", network.String(), prefixLen)
+}
+
+// getIPv6Prefix48 extracts the /48 prefix from an IPv6 address as a string
+func getIPv6Prefix48(ip net.IP) string {
+	if ip == nil {
+		return ""
+	}
+	if ip.To4() != nil {
+		return ""
+	}
+	if len(ip) != 16 {
+		ip = ip.To16()
+		if ip == nil {
+			return ""
+		}
+	}
+	// Take first 6 bytes (48 bits) and zero the rest
+	prefix := make(net.IP, 16)
+	copy(prefix[:6], ip[:6])
+	return prefix.String() + "/48"
+}
+
+// ipMatchesPrefix checks if an IP matches a given prefix (e.g. "2001:db8::/64")
+func ipMatchesPrefix(ip net.IP, prefixStr string) bool {
+	_, network, err := net.ParseCIDR(prefixStr)
+	if err != nil {
+		return false
+	}
+	return network.Contains(ip)
+}
+
 // sortIPsByRange sorts IPs by private range (10.x, 172.16.x, 192.168.x, IPv6) then numerically
 func sortIPsByRange(ips []string) {
 	sort.Slice(ips, func(i, j int) bool {
@@ -382,4 +443,25 @@ func sortIPsByRange(ips []string) {
 		// IPv4 before IPv6
 		return ipA4 != nil
 	})
+}
+
+// copyToClipboard copies text to the system clipboard
+func copyToClipboard(text string) error {
+	var cmd *exec.Cmd
+
+	switch runtime.GOOS {
+	case "windows":
+		cmd = exec.Command("cmd", "/c", "echo|set /p="+text+"|clip")
+	case "darwin":
+		cmd = exec.Command("pbcopy")
+		cmd.Stdin = strings.NewReader(text)
+	case "linux":
+		// Try xclip first, then xsel
+		cmd = exec.Command("xclip", "-selection", "clipboard")
+		cmd.Stdin = strings.NewReader(text)
+	default:
+		return fmt.Errorf("clipboard not supported on %s", runtime.GOOS)
+	}
+
+	return cmd.Run()
 }

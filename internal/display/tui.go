@@ -1,6 +1,7 @@
 package display
 
 import (
+	"net"
 	"strings"
 	"time"
 
@@ -11,6 +12,53 @@ import (
 	"netflow-collector/internal/store"
 	"netflow-collector/pkg/types"
 )
+
+// DNSDisplayMode controls how DNS hostnames are displayed
+type DNSDisplayMode int
+
+const (
+	DNSModeOff        DNSDisplayMode = iota // Show only IPs
+	DNSModeAll                              // Show all resolved hostnames
+	DNSModeReverse                          // Show only reverse DNS (PTR)
+	DNSModeTechnitium                       // Show only Technitium DNS
+	DNSModeMDNS                             // Show only mDNS (.local)
+)
+
+// String returns the display name for the DNS mode
+func (m DNSDisplayMode) String() string {
+	switch m {
+	case DNSModeOff:
+		return "Off"
+	case DNSModeAll:
+		return "All"
+	case DNSModeReverse:
+		return "Reverse"
+	case DNSModeTechnitium:
+		return "Technitium"
+	case DNSModeMDNS:
+		return "mDNS"
+	default:
+		return "?"
+	}
+}
+
+// ShortString returns a short label for status display
+func (m DNSDisplayMode) ShortString() string {
+	switch m {
+	case DNSModeOff:
+		return "OFF"
+	case DNSModeAll:
+		return "ALL"
+	case DNSModeReverse:
+		return "REV"
+	case DNSModeTechnitium:
+		return "TECH"
+	case DNSModeMDNS:
+		return "MDNS"
+	default:
+		return "?"
+	}
+}
 
 // TUI represents the interactive terminal UI
 type TUI struct {
@@ -29,14 +77,21 @@ type TUI struct {
 	// Interface statistics page
 	interfaceTable      *tview.Table
 	interfaceLayout     *tview.Flex
-	currentPage         int                        // 0 = flows, 1 = interfaces
-	interfaceStats      map[uint16]*InterfaceStats // Cumulative interface statistics
-	lastInterfaceUpdate time.Time                  // Track when we last updated stats
-	selectedInterfaces  map[uint16]bool            // Interfaces marked with Space for filtering
+	currentPage         int                            // 0 = flows, 1 = interfaces, 2 = services
+	interfaceStats      map[InterfaceKey]*InterfaceStats // Cumulative interface statistics (by ID+direction)
+	lastInterfaceUpdate time.Time                      // Track when we last updated stats
+	selectedInterfaces  map[InterfaceKey]bool          // Interfaces marked with Space for filtering
+
+	// Service statistics page
+	serviceTable        *tview.Table
+	serviceLayout       *tview.Flex
+	serviceSortField    ServiceSortField
+	serviceSortAsc      bool
+	currentServiceStats []*ServiceStats
 
 	// IP detail modal state
 	ipDetailTable    *tview.Table
-	ipDetailIfaceID  uint16
+	ipDetailIfaceKey InterfaceKey
 	ipDetailSelected map[string]bool
 	ipDetailVisible  bool
 
@@ -47,9 +102,9 @@ type TUI struct {
 	paused       bool
 	showHelp     bool
 	showDetail   bool
-	showVersion  bool // Version column hidden by default
-	showDNS      bool // Show hostnames instead of IPs
-	showService  bool // Show service names for ports
+	showVersion  bool           // Version column hidden by default
+	dnsMode      DNSDisplayMode // DNS display mode (Off, All, Reverse, Technitium, mDNS)
+	showService  bool           // Show service names for ports
 	filterActive bool // Is filter input focused
 	refreshRate  time.Duration
 	stopChan     chan struct{}
@@ -78,12 +133,20 @@ type TUI struct {
 
 	// Flow aggregation (merge flows with same 5-tuple)
 	aggregateFlows bool
+
+	// Own IPv6 prefix (learned from flow data - most common prefix)
+	ownIPv6Prefix  string                     // Our prefix (e.g. /56)
+	ownPrefixLen   int                        // Configured prefix length (default 56)
+	seenIPv6ByPfx  map[string]map[string]bool // prefix -> set of unique IPs
 }
 
 // NewTUI creates a new interactive TUI
-func NewTUI(s *store.FlowStore, refreshRate time.Duration) *TUI {
+func NewTUI(s *store.FlowStore, refreshRate time.Duration, prefixLen int) *TUI {
 	if refreshRate == 0 {
 		refreshRate = 500 * time.Millisecond
+	}
+	if prefixLen <= 0 || prefixLen > 128 {
+		prefixLen = 56 // Default to /56 (common PD size)
 	}
 
 	t := &TUI{
@@ -92,13 +155,16 @@ func NewTUI(s *store.FlowStore, refreshRate time.Duration) *TUI {
 		resolver:           resolver.New(),
 		sortField:          store.SortByTime,
 		sortAsc:            false,
-		showService:        true,  // Enable service names by default
-		aggregateFlows:     true,  // Aggregate flows with same 5-tuple by default
+		dnsMode:            DNSModeOff, // Start with DNS off, 'n' cycles through modes
+		showService:        true,       // Enable service names by default
+		aggregateFlows:     true,       // Aggregate flows with same 5-tuple by default
 		refreshRate:        refreshRate,
 		stopChan:           make(chan struct{}),
 		filterHistory:      loadFilterHistory(),
-		interfaceStats:     make(map[uint16]*InterfaceStats),
-		selectedInterfaces: make(map[uint16]bool),
+		interfaceStats:     make(map[InterfaceKey]*InterfaceStats),
+		selectedInterfaces: make(map[InterfaceKey]bool),
+		ownPrefixLen:       prefixLen,
+		seenIPv6ByPfx:      make(map[string]map[string]bool),
 	}
 
 	t.setupUI()
@@ -131,7 +197,7 @@ func (t *TUI) setupUI() {
 		SetBorders(false).
 		SetSelectable(true, false).
 		SetFixed(1, 0)
-	t.interfaceTable.SetBorder(true).SetTitle(" Interfaces [F1=Flows] [Space=Mark] [Enter=Filter] ")
+	t.interfaceTable.SetBorder(true).SetTitle(" Interfaces [F1=Flows] [Space=Pause] [m=Mark] [Enter=Filter] ")
 	t.setupInterfaceTableHeaders()
 
 	// Setup filter input with native autocomplete
@@ -178,10 +244,21 @@ func (t *TUI) setupUI() {
 		AddItem(interfaceTopRow, 5, 0, false).
 		AddItem(t.interfaceTable, 0, 1, true)
 
+	// Service statistics table and layout (Services page)
+	t.setupServiceTable()
+	serviceTopRow := tview.NewFlex().
+		AddItem(t.statsView, 0, 2, false).
+		AddItem(t.filterView, 0, 1, false)
+	t.serviceLayout = tview.NewFlex().SetDirection(tview.FlexRow).
+		AddItem(t.filterInput, 3, 0, false).
+		AddItem(serviceTopRow, 7, 0, false).
+		AddItem(t.serviceTable, 0, 1, true)
+
 	// Pages for page switching and overlay support
 	t.pages = tview.NewPages().
 		AddPage("flows", t.layout, true, true).
-		AddPage("interfaces", t.interfaceLayout, true, false)
+		AddPage("interfaces", t.interfaceLayout, true, false).
+		AddPage("services", t.serviceLayout, true, false)
 
 	// Setup table headers
 	t.setupTableHeaders()
@@ -189,6 +266,9 @@ func (t *TUI) setupUI() {
 	t.app.EnableMouse(true)
 	t.app.SetRoot(t.pages, true)
 	t.app.SetFocus(t.filterInput)
+
+	// Setup mouse handler for context menu
+	t.setupMouseHandler()
 }
 
 // setupKeyBindings configures all keyboard event handlers
@@ -197,16 +277,20 @@ func (t *TUI) setupKeyBindings() {
 	t.interfaceTable.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		switch event.Key() {
 		case tcell.KeyRune:
-			if event.Rune() == ' ' {
+			switch event.Rune() {
+			case ' ':
+				// Pause/Resume
+				t.paused = !t.paused
+				return nil
+			case 'm':
 				// Toggle selection of current interface
 				row, _ := t.interfaceTable.GetSelection()
 				if row > 0 { // Skip header
-					ifaceID := t.getInterfaceIDFromRow(row)
-					if ifaceID > 0 {
-						if t.selectedInterfaces[ifaceID] {
-							delete(t.selectedInterfaces, ifaceID)
+					if key, ok := t.getInterfaceKeyFromRow(row); ok {
+						if t.selectedInterfaces[key] {
+							delete(t.selectedInterfaces, key)
 						} else {
-							t.selectedInterfaces[ifaceID] = true
+							t.selectedInterfaces[key] = true
 						}
 						t.updateInterfaceTable()
 					}
@@ -221,9 +305,8 @@ func (t *TUI) setupKeyBindings() {
 			} else {
 				// Show IP detail view for current interface
 				row, _ := t.interfaceTable.GetSelection()
-				ifaceID := t.getInterfaceIDFromRow(row)
-				if ifaceID > 0 {
-					t.showInterfaceDetail(ifaceID)
+				if key, ok := t.getInterfaceKeyFromRow(row); ok {
+					t.showInterfaceDetail(key)
 					return nil
 				}
 			}
@@ -277,7 +360,8 @@ func (t *TUI) setupKeyBindings() {
 				t.app.Stop()
 				return nil
 			case 'n':
-				t.showDNS = !t.showDNS
+				// Cycle through DNS modes: Off -> All -> Reverse -> Technitium -> mDNS -> Off
+				t.dnsMode = (t.dnsMode + 1) % 5
 				return nil
 			case 'e':
 				t.showService = !t.showService
@@ -309,21 +393,17 @@ func (t *TUI) setupKeyBindings() {
 			t.app.Stop()
 			return nil
 		}
-		// F1/F2 switch pages
+		// F1/F2/F3 switch pages
 		if event.Key() == tcell.KeyF1 {
-			if t.currentPage != 0 {
-				t.currentPage = 0
-				t.pages.SwitchToPage("flows")
-				t.app.SetFocus(t.filterInput)
-			}
+			t.switchToPage(0)
 			return nil
 		}
 		if event.Key() == tcell.KeyF2 {
-			if t.currentPage != 1 {
-				t.currentPage = 1
-				t.pages.SwitchToPage("interfaces")
-				t.app.SetFocus(t.interfaceTable)
-			}
+			t.switchToPage(1)
+			return nil
+		}
+		if event.Key() == tcell.KeyF3 {
+			t.switchToPage(2)
 			return nil
 		}
 		// F12 toggles BiFlow mode
@@ -338,6 +418,25 @@ func (t *TUI) setupKeyBindings() {
 	})
 }
 
+// switchToPage switches to the specified page (0=flows, 1=interfaces, 2=services)
+func (t *TUI) switchToPage(page int) {
+	if t.currentPage == page {
+		return
+	}
+	t.currentPage = page
+	switch page {
+	case 0:
+		t.pages.SwitchToPage("flows")
+		t.app.SetFocus(t.filterInput)
+	case 1:
+		t.pages.SwitchToPage("interfaces")
+		t.app.SetFocus(t.interfaceTable)
+	case 2:
+		t.pages.SwitchToPage("services")
+		t.app.SetFocus(t.serviceTable)
+	}
+}
+
 // columnDef defines a table column with minimum width and flex behavior
 type columnDef struct {
 	name     string
@@ -347,9 +446,9 @@ type columnDef struct {
 
 // updateTableTitle updates the flow table title based on current mode
 func (t *TUI) updateTableTitle() {
-	title := " Flows [F2=Interfaces] [F12=BiFlow] "
+	title := " Flows [F2=Interfaces] [F3=Services] [F12=BiFlow] "
 	if t.biflowMode {
-		title = " BiFlow [F2=Interfaces] [F12=Flows] "
+		title = " BiFlow [F2=Interfaces] [F3=Services] [F12=Flows] "
 	}
 	t.table.SetTitle(title)
 }
@@ -516,10 +615,20 @@ func (t *TUI) refresh() {
 		t.updateInterfaceTable()
 	}
 
+	// Update service table display if on that page
+	if t.currentPage == 2 {
+		t.updateServiceTable()
+	}
+
 	// Update IP detail modal if visible
 	if t.ipDetailVisible {
 		t.updateIPDetailTable()
 	}
+}
+
+// GetResolver returns the TUI's resolver for external integrations
+func (t *TUI) GetResolver() *resolver.Resolver {
+	return t.resolver
 }
 
 // Run starts the TUI
@@ -549,4 +658,64 @@ func (t *TUI) Run() error {
 func (t *TUI) Stop() {
 	close(t.stopChan)
 	t.app.Stop()
+}
+
+// isInternalIP checks if an IP is "internal" - either a private IP or
+// belongs to our own IPv6 prefix (fetched from external service)
+func (t *TUI) isInternalIP(ip net.IP) bool {
+	if ip == nil {
+		return false
+	}
+
+	// Check standard private ranges first
+	if isPrivateIP(ip) {
+		return true
+	}
+
+	// For IPv6, check if it matches our own prefix
+	if ip.To4() == nil && t.ownIPv6Prefix != "" {
+		if ipMatchesPrefix(ip, t.ownIPv6Prefix) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// learnIPv6Prefix records an IPv6 address and updates the most common prefix
+func (t *TUI) learnIPv6Prefix(ip net.IP) {
+	if ip == nil || ip.To4() != nil {
+		return // Only IPv6
+	}
+	if isPrivateIP(ip) {
+		return // Skip private/ULA addresses
+	}
+
+	// Get the prefix for this IP
+	prefix := getIPv6PrefixN(ip, t.ownPrefixLen)
+	if prefix == "" {
+		return
+	}
+
+	// Add IP to the set for this prefix
+	ipStr := ip.String()
+	if t.seenIPv6ByPfx[prefix] == nil {
+		t.seenIPv6ByPfx[prefix] = make(map[string]bool)
+	}
+	t.seenIPv6ByPfx[prefix][ipStr] = true
+
+	// Find the prefix with most unique IPs
+	var bestPrefix string
+	var bestCount int
+	for pfx, ips := range t.seenIPv6ByPfx {
+		if len(ips) > bestCount {
+			bestCount = len(ips)
+			bestPrefix = pfx
+		}
+	}
+
+	// Update our prefix if we found a clear winner (at least 3 unique IPs)
+	if bestCount >= 3 && bestPrefix != "" {
+		t.ownIPv6Prefix = bestPrefix
+	}
 }

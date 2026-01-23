@@ -343,10 +343,19 @@ func (t *TUI) updateFilterView() {
 		t.filterInput.SetLabelColor(tcell.ColorWhite)
 	}
 
-	// Display options
-	dnsStatus := "[gray]off[white]"
-	if t.showDNS {
-		dnsStatus = "[green]on[white]"
+	// Display options - DNS mode with color coding
+	var dnsStatus string
+	switch t.dnsMode {
+	case DNSModeOff:
+		dnsStatus = "[gray]OFF[white]"
+	case DNSModeAll:
+		dnsStatus = "[green]ALL[white]"
+	case DNSModeReverse:
+		dnsStatus = "[#00BFFF]REV[white]" // DeepSkyBlue for Reverse DNS
+	case DNSModeTechnitium:
+		dnsStatus = "[#FF8C00]TECH[white]" // DarkOrange for Technitium
+	case DNSModeMDNS:
+		dnsStatus = "[#9370DB]MDNS[white]" // MediumPurple for mDNS
 	}
 	svcStatus := "[gray]off[white]"
 	if t.showService {

@@ -12,6 +12,33 @@ import (
 	"github.com/miekg/dns"
 )
 
+// DNSSource indicates where a hostname resolution came from
+type DNSSource int
+
+const (
+	SourceNone       DNSSource = iota // No resolution
+	SourceReverse                     // Classic reverse DNS (PTR lookup)
+	SourceMDNS                        // Multicast DNS (.local)
+	SourceTechnitium                  // Technitium DNS query logs
+	SourceMAC                         // MAC address correlation (IPv6 EUI-64)
+)
+
+// String returns a short label for the DNS source
+func (s DNSSource) String() string {
+	switch s {
+	case SourceReverse:
+		return "R"
+	case SourceMDNS:
+		return "M"
+	case SourceTechnitium:
+		return "T"
+	case SourceMAC:
+		return "C" // Correlation
+	default:
+		return ""
+	}
+}
+
 // Resolver handles DNS lookups with caching
 type Resolver struct {
 	mu       sync.RWMutex
@@ -26,6 +53,7 @@ type cacheEntry struct {
 	hostname  string
 	timestamp time.Time
 	notFound  bool
+	source    DNSSource
 }
 
 // New creates a new resolver
@@ -297,6 +325,7 @@ func (r *Resolver) lookup(ipStr string) string {
 	names, err := net.DefaultResolver.LookupAddr(ctx, ipStr)
 
 	var hostname string
+	var source DNSSource
 	dnsWorked := false
 
 	if err == nil && len(names) > 0 {
@@ -309,6 +338,7 @@ func (r *Resolver) lookup(ipStr string) string {
 		// Check if the hostname is actually helpful
 		if !isUnhelpfulHostname(hostname, ipStr) {
 			dnsWorked = true
+			source = SourceReverse
 		}
 	}
 
@@ -317,6 +347,7 @@ func (r *Resolver) lookup(ipStr string) string {
 		if mdnsHostname := r.lookupMDNS(ipStr); mdnsHostname != "" {
 			hostname = mdnsHostname
 			dnsWorked = true
+			source = SourceMDNS
 		}
 	}
 
@@ -330,6 +361,7 @@ func (r *Resolver) lookup(ipStr string) string {
 			if cachedHostname, ok := r.macCache[mac]; ok {
 				hostname = cachedHostname
 				dnsWorked = true
+				source = SourceMAC
 			}
 			r.mu.RUnlock()
 		}
@@ -343,6 +375,7 @@ func (r *Resolver) lookup(ipStr string) string {
 			hostname:  ipStr,
 			timestamp: time.Now(),
 			notFound:  true,
+			source:    SourceNone,
 		}
 		return ipStr
 	}
@@ -352,6 +385,7 @@ func (r *Resolver) lookup(ipStr string) string {
 		hostname:  hostname,
 		timestamp: time.Now(),
 		notFound:  false,
+		source:    source,
 	}
 
 	// For IPv6 with EUI-64: also store MAC -> hostname correlation
@@ -364,8 +398,14 @@ func (r *Resolver) lookup(ipStr string) string {
 
 // GetCached returns cached hostname or empty string
 func (r *Resolver) GetCached(ip net.IP) (string, bool) {
+	hostname, _, found := r.GetCachedWithSource(ip)
+	return hostname, found
+}
+
+// GetCachedWithSource returns cached hostname, its source, and whether it was found
+func (r *Resolver) GetCachedWithSource(ip net.IP) (string, DNSSource, bool) {
 	if ip == nil {
-		return "", false
+		return "", SourceNone, false
 	}
 	ipStr := ip.String()
 
@@ -375,7 +415,7 @@ func (r *Resolver) GetCached(ip net.IP) (string, bool) {
 	// Check regular cache first
 	if entry, ok := r.cache[ipStr]; ok {
 		if time.Since(entry.timestamp) < r.maxAge && !entry.notFound {
-			return entry.hostname, true
+			return entry.hostname, entry.source, true
 		}
 	}
 
@@ -383,12 +423,12 @@ func (r *Resolver) GetCached(ip net.IP) (string, bool) {
 	if ip.To4() == nil {
 		if mac := extractMACFromIPv6(ip); mac != "" {
 			if hostname, ok := r.macCache[mac]; ok {
-				return hostname, true
+				return hostname, SourceMAC, true
 			}
 		}
 	}
 
-	return "", false
+	return "", SourceNone, false
 }
 
 // CacheSize returns the number of cached entries
@@ -403,4 +443,35 @@ func (r *Resolver) Clear() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.cache = make(map[string]cacheEntry)
+}
+
+// InjectCache allows external sources (like Technitium DNS) to inject
+// IP -> hostname mappings directly into the cache
+func (r *Resolver) InjectCache(ipStr, hostname string) {
+	r.InjectCacheWithSource(ipStr, hostname, SourceTechnitium)
+}
+
+// InjectCacheWithSource allows external sources to inject mappings with a specific source
+func (r *Resolver) InjectCacheWithSource(ipStr, hostname string, source DNSSource) {
+	if hostname == "" || ipStr == "" {
+		return
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	// Check if we already have a valid entry
+	if entry, ok := r.cache[ipStr]; ok {
+		// Don't overwrite existing good entries (prefer reverse DNS over external sources)
+		if !entry.notFound && time.Since(entry.timestamp) < r.maxAge {
+			return
+		}
+	}
+
+	r.cache[ipStr] = cacheEntry{
+		hostname:  hostname,
+		timestamp: time.Now(),
+		notFound:  false,
+		source:    source,
+	}
 }
