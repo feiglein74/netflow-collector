@@ -108,6 +108,19 @@ func (c *ConditionNode) Evaluate(flow *types.Flow) bool {
 		result = flow.InputIf == c.Interface
 	case "outif":
 		result = flow.OutputIf == c.Interface
+	case "self", "local":
+		// Match flows where source == destination (self-traffic)
+		result = srcIP == dstIP
+	case "version", "ipversion":
+		// Match IPv4 (4) or IPv6 (6)
+		isV4 := flow.SrcAddr.To4() != nil
+		if c.Value == "4" || c.Value == "v4" || c.Value == "ipv4" {
+			result = isV4
+		} else if c.Value == "6" || c.Value == "v6" || c.Value == "ipv6" {
+			result = !isV4
+		} else {
+			result = true // unknown version value matches all
+		}
 	default:
 		result = true
 	}
@@ -193,6 +206,8 @@ var ValidFields = map[string]bool{
 	"proto": true, "protocol": true,
 	"service": true, "svc": true,
 	"if": true, "inif": true, "outif": true,
+	"self": true, "local": true,
+	"version": true, "ipversion": true,
 }
 
 // Token types for the filter parser
@@ -284,11 +299,18 @@ func tokenize(s string) []token {
 			}
 		}
 
-		// Read a condition (everything until space, paren, or operator)
+		// Check for comma (implicit AND)
+		if s[i] == ',' {
+			tokens = append(tokens, token{tokenAnd, ","})
+			i++
+			continue
+		}
+
+		// Read a condition (everything until space, paren, comma, or operator)
 		start := i
 		for i < len(s) {
 			c := s[i]
-			if c == ' ' || c == '\t' || c == '(' || c == ')' {
+			if c == ' ' || c == '\t' || c == '(' || c == ')' || c == ',' {
 				break
 			}
 			if i+1 < len(s) && (s[i:i+2] == "&&" || s[i:i+2] == "||") {
@@ -461,8 +483,12 @@ func (p *parser) parseCondition(s string) ExprNode {
 			// No operator found - try implicit detection
 			lowerS := strings.ToLower(s)
 
-			// Check if it's a known protocol
-			if knownProtocols[lowerS] {
+			// Check for special keywords
+			if lowerS == "self" || lowerS == "local" {
+				key = "self"
+				value = "true"
+			} else if knownProtocols[lowerS] {
+				// Check if it's a known protocol
 				key = "proto"
 				value = lowerS
 			} else if resolver.IsKnownService(lowerS) {
@@ -968,6 +994,29 @@ func (fs *FlowStore) GetFilteredStats(filter *Filter) FilteredStats {
 	var stats FilteredStats
 	for i := range fs.flows {
 		if filter == nil || filter.IsEmpty() || filter.Matches(&fs.flows[i]) {
+			stats.Count++
+			stats.Bytes += fs.flows[i].Bytes
+			stats.Packets += fs.flows[i].Packets
+		}
+	}
+	return stats
+}
+
+// SelfTrafficStats holds statistics for self-referential flows (src == dst)
+type SelfTrafficStats struct {
+	Count   int
+	Bytes   uint64
+	Packets uint64
+}
+
+// GetSelfTrafficStats returns stats for flows where source IP equals destination IP
+func (fs *FlowStore) GetSelfTrafficStats() SelfTrafficStats {
+	fs.mu.RLock()
+	defer fs.mu.RUnlock()
+
+	var stats SelfTrafficStats
+	for i := range fs.flows {
+		if fs.flows[i].SrcAddr.Equal(fs.flows[i].DstAddr) {
 			stats.Count++
 			stats.Bytes += fs.flows[i].Bytes
 			stats.Packets += fs.flows[i].Packets

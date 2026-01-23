@@ -549,14 +549,23 @@ func (t *TUI) updateStats() {
 			evictionStats.LRUProtected)
 	}
 
+	// Self-traffic stats (src == dst)
+	selfStats := t.store.GetSelfTrafficStats()
+	selfText := ""
+	if selfStats.Count > 0 {
+		selfText = fmt.Sprintf("  [cyan]Self:[white] %d (%s)",
+			selfStats.Count, formatBytes(selfStats.Bytes))
+	}
+
 	text := fmt.Sprintf(
-		"[yellow]Flows:[white] %s  [yellow]Mem:[white] %s  [yellow]Rate:[white] %s/s  [yellow]Throughput:[white] %s/s%s%s\n"+
+		"[yellow]Flows:[white] %s  [yellow]Mem:[white] %s  [yellow]Rate:[white] %s/s  [yellow]Throughput:[white] %s/s%s%s%s\n"+
 			"[yellow]Versions:[white] %s  [yellow]Exporters:[white] %d  [yellow]Showing:[white] %s%s",
 		formatNumber(int(stats.TotalFlows)),
 		memText,
 		formatDecimal(stats.FlowsPerSecond, 1),
 		formatBytes(uint64(stats.BytesPerSecond)),
 		evictionText,
+		selfText,
 		pauseIndicator,
 		versionText,
 		stats.UniqueExporters,

@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NetFlow Sankey Visualization</title>
+    <link rel="stylesheet" href="style.css">
+    <script src="https://d3js.org/d3.v7.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/d3-sankey@0.12.3/dist/d3-sankey.min.js"></script>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>NetFlow Sankey</h1>
+            <div class="controls">
+                <div class="control-group">
+                    <label>Mode:</label>
+                    <select id="mode-select">
+                        <option value="ip-to-ip">IP to IP</option>
+                        <option value="ip-to-service">IP to Service</option>
+                        <option value="firewall">Firewall (IP → IF → IF → IP)</option>
+                    </select>
+                </div>
+                <div class="control-group firewall-only" id="interface-selects" style="display: none;">
+                    <label>Left:</label>
+                    <select id="left-exporter-select">
+                        <option value="">All Exporters</option>
+                    </select>
+                    <select id="left-if-select">
+                        <option value="0">All IFs</option>
+                    </select>
+                    <label>Right:</label>
+                    <select id="right-exporter-select">
+                        <option value="">All Exporters</option>
+                    </select>
+                    <select id="right-if-select">
+                        <option value="0">Auto (WAN)</option>
+                    </select>
+                </div>
+                <div class="control-group">
+                    <label>IP:</label>
+                    <select id="ipversion-select">
+                        <option value="all">All</option>
+                        <option value="v4">IPv4</option>
+                        <option value="v6">IPv6</option>
+                    </select>
+                </div>
+                <div class="control-group">
+                    <label>Time:</label>
+                    <select id="timerange-select">
+                        <option value="1m">Last 1 min</option>
+                        <option value="5m">Last 5 min</option>
+                        <option value="15m" selected>Last 15 min</option>
+                        <option value="30m">Last 30 min</option>
+                        <option value="1h">Last 1 hour</option>
+                        <option value="6h">Last 6 hours</option>
+                        <option value="24h">Last 24 hours</option>
+                        <option value="all">All</option>
+                    </select>
+                </div>
+                <div class="control-group">
+                    <label>Filter:</label>
+                    <input type="text" id="filter-input" placeholder="e.g., proto=tcp port:443 or if:1,!ip:10.0.0.1">
+                    <button id="apply-filter">Apply</button>
+                    <button id="clear-filter">Clear</button>
+                </div>
+                <div class="control-group">
+                    <label>Top N:</label>
+                    <input type="range" id="topn-slider" min="10" max="200" value="50">
+                    <span id="topn-value">50</span>
+                </div>
+                <div class="control-group">
+                    <label>
+                        <input type="checkbox" id="auto-refresh">
+                        Auto-refresh (10s)
+                    </label>
+                </div>
+                <div class="control-group">
+                    <button id="refresh-btn">Refresh Now</button>
+                </div>
+            </div>
+        </header>
+
+        <div class="stats-bar">
+            <span id="stats-flows">Flows: -</span>
+            <span id="stats-bytes">Bytes: -</span>
+            <span id="stats-packets">Packets: -</span>
+            <span id="stats-updated">Updated: -</span>
+            <span id="connection-status" class="status-ok">Connected</span>
+        </div>
+
+        <main>
+            <div id="sankey-container">
+                <svg id="sankey-svg"></svg>
+            </div>
+            <div id="tooltip" class="tooltip"></div>
+        </main>
+
+        <footer>
+            <p>NetFlow Collector - Sankey Visualization</p>
+        </footer>
+    </div>
+
+    <script src="sankey.js"></script>
+</body>
+</html>

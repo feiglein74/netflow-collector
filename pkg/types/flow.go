@@ -6,7 +6,7 @@ import (
 	"time"
 )
 
-// FlowVersion represents the NetFlow/IPFIX version
+// FlowVersion repräsentiert die NetFlow/IPFIX Version
 type FlowVersion int
 
 const (
@@ -28,7 +28,7 @@ func (v FlowVersion) String() string {
 	}
 }
 
-// Flow represents a single network flow record
+// Flow repräsentiert einen einzelnen Netzwerk-Flow-Datensatz
 type Flow struct {
 	Version      FlowVersion
 	SrcAddr      net.IP
@@ -47,10 +47,10 @@ type Flow struct {
 	OutputIf     uint16
 	ExporterIP   net.IP
 	ReceivedAt   time.Time
-	LastAccessed time.Time // LRU tracking - when flow was last viewed/queried
+	LastAccessed time.Time // LRU-Tracking - wann der Flow zuletzt angezeigt/abgefragt wurde
 }
 
-// ProtocolName returns the human-readable protocol name
+// ProtocolName gibt den lesbaren Protokollnamen zurück
 func (f *Flow) ProtocolName() string {
 	switch f.Protocol {
 	case 1:
@@ -76,7 +76,7 @@ func (f *Flow) ProtocolName() string {
 	}
 }
 
-// TCPFlagsString returns TCP flags as string
+// TCPFlagsString gibt TCP-Flags als String zurück
 func (f *Flow) TCPFlagsString() string {
 	if f.Protocol != 6 {
 		return "-"
@@ -106,12 +106,12 @@ func (f *Flow) TCPFlagsString() string {
 	return flags
 }
 
-// Duration returns the flow duration
+// Duration gibt die Flow-Dauer zurück
 func (f *Flow) Duration() time.Duration {
 	return f.EndTime.Sub(f.StartTime)
 }
 
-// BytesPerSecond calculates the throughput
+// BytesPerSecond berechnet den Durchsatz
 func (f *Flow) BytesPerSecond() float64 {
 	d := f.Duration().Seconds()
 	if d <= 0 {
@@ -120,7 +120,7 @@ func (f *Flow) BytesPerSecond() float64 {
 	return float64(f.Bytes) / d
 }
 
-// FlowKey generates a unique key for the flow (for aggregation)
+// FlowKey generiert einen eindeutigen Schlüssel für den Flow (für Aggregation)
 func (f *Flow) FlowKey() string {
 	return fmt.Sprintf("%s:%d-%s:%d-%d",
 		f.SrcAddr, f.SrcPort,
@@ -128,9 +128,9 @@ func (f *Flow) FlowKey() string {
 		f.Protocol)
 }
 
-// ConversationKey generates a bidirectional key (same for both directions)
+// ConversationKey generiert einen bidirektionalen Schlüssel (gleich für beide Richtungen)
 func (f *Flow) ConversationKey() string {
-	// Normalize: smaller IP:port first
+	// Normalisieren: kleinere IP:Port zuerst
 	src := fmt.Sprintf("%s:%d", f.SrcAddr, f.SrcPort)
 	dst := fmt.Sprintf("%s:%d", f.DstAddr, f.DstPort)
 	if src < dst {
@@ -139,52 +139,52 @@ func (f *Flow) ConversationKey() string {
 	return fmt.Sprintf("%s-%s-%d", dst, src, f.Protocol)
 }
 
-// Conversation represents a bidirectional flow (request + response)
+// Conversation repräsentiert einen bidirektionalen Flow (Anfrage + Antwort)
 type Conversation struct {
-	// Endpoint A (the "smaller" IP:port lexicographically)
-	AddrA    net.IP
-	PortA    uint16
-	// Endpoint B
+	// Endpunkt A (die lexikografisch "kleinere" IP:Port)
+	AddrA net.IP
+	PortA uint16
+	// Endpunkt B
 	AddrB    net.IP
 	PortB    uint16
 	Protocol uint8
 
-	// Forward direction (A -> B)
+	// Vorwärtsrichtung (A -> B)
 	BytesAtoB   uint64
 	PacketsAtoB uint64
 	FlowsAtoB   int
 
-	// Reverse direction (B -> A)
+	// Rückwärtsrichtung (B -> A)
 	BytesBtoA   uint64
 	PacketsBtoA uint64
 	FlowsBtoA   int
 
-	// Aggregated timing
+	// Aggregierte Zeitstempel
 	FirstSeen time.Time
 	LastSeen  time.Time
 
-	// For display
+	// Für Anzeige
 	InputIf    uint16
 	OutputIf   uint16
 	ExporterIP net.IP
 }
 
-// TotalBytes returns total bytes in both directions
+// TotalBytes gibt die Gesamtbytes in beide Richtungen zurück
 func (c *Conversation) TotalBytes() uint64 {
 	return c.BytesAtoB + c.BytesBtoA
 }
 
-// TotalPackets returns total packets in both directions
+// TotalPackets gibt die Gesamtpakete in beide Richtungen zurück
 func (c *Conversation) TotalPackets() uint64 {
 	return c.PacketsAtoB + c.PacketsBtoA
 }
 
-// IsBidirectional returns true if traffic exists in both directions
+// IsBidirectional gibt true zurück wenn Traffic in beide Richtungen existiert
 func (c *Conversation) IsBidirectional() bool {
 	return c.FlowsAtoB > 0 && c.FlowsBtoA > 0
 }
 
-// ProtocolName returns the human-readable protocol name
+// ProtocolName gibt den lesbaren Protokollnamen zurück
 func (c *Conversation) ProtocolName() string {
 	switch c.Protocol {
 	case 1:
@@ -210,7 +210,7 @@ func (c *Conversation) ProtocolName() string {
 	}
 }
 
-// Key returns a unique identifier for this conversation
+// Key gibt einen eindeutigen Bezeichner für diese Conversation zurück
 func (c *Conversation) Key() string {
 	return fmt.Sprintf("%s:%d-%s:%d-%d", c.AddrA, c.PortA, c.AddrB, c.PortB, c.Protocol)
 }

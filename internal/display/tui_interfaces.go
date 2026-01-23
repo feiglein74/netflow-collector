@@ -37,6 +37,8 @@ type InterfaceStats struct {
 	PrivateIPv6s    map[string]bool // Set of private/ULA IPv6s seen on this interface
 	PublicIPs       map[string]bool // Set of public IPv4s seen on this interface
 	PublicIPv6s     map[string]bool // Set of public IPv6s seen on this interface
+	BytesToPublic   uint64          // Bytes sent to public destinations (for WAN detection)
+	FlowsToPublic   int             // Flows to public destinations
 	LastSubnet      string          // Last calculated IPv4 subnet
 	LastSubnetV6    string          // Last calculated IPv6 subnet
 	SubnetChanged   time.Time       // When IPv4 subnet last changed
@@ -152,6 +154,9 @@ func (t *TUI) updateInterfaceStats() {
 						stats.PrivateIPv6s[flow.DstAddr.String()] = true
 					}
 				} else {
+					// Track traffic to public destinations (for WAN detection)
+					stats.BytesToPublic += flow.Bytes
+					stats.FlowsToPublic++
 					if flow.DstAddr.To4() != nil {
 						stats.PublicIPs[flow.DstAddr.String()] = true
 					} else {
@@ -190,6 +195,41 @@ func (t *TUI) getInterfaceStats() []InterfaceStats {
 	return stats
 }
 
+// GuessWANInterface returns the interface ID that is most likely the WAN/public interface
+// Detection: Interface (any direction) with the most unique public IPs seen
+// This works because WAN sees ALL public IPs the network communicates with
+func (t *TUI) GuessWANInterface() (uint16, int) {
+	// Aggregate public IP counts per interface ID (combine In + Out directions)
+	ifacePublicIPs := make(map[uint16]map[string]bool)
+
+	for key, stats := range t.interfaceStats {
+		if ifacePublicIPs[key.ID] == nil {
+			ifacePublicIPs[key.ID] = make(map[string]bool)
+		}
+		// Collect all public IPs seen on this interface
+		for ip := range stats.PublicIPs {
+			ifacePublicIPs[key.ID][ip] = true
+		}
+		for ip := range stats.PublicIPv6s {
+			ifacePublicIPs[key.ID][ip] = true
+		}
+	}
+
+	// Find interface with most unique public IPs
+	var wanID uint16
+	var maxPublicIPs int
+
+	for ifaceID, publicIPs := range ifacePublicIPs {
+		count := len(publicIPs)
+		if count > maxPublicIPs {
+			maxPublicIPs = count
+			wanID = ifaceID
+		}
+	}
+
+	return wanID, maxPublicIPs
+}
+
 // updateInterfaceTable updates the interface statistics table
 func (t *TUI) updateInterfaceTable() {
 	// Update subnet calculations and detect changes
@@ -213,6 +253,9 @@ func (t *TUI) updateInterfaceTable() {
 
 	sortedStats := t.getInterfaceStats()
 
+	// Guess WAN interface (by most unique public IPs)
+	wanID, wanPublicCount := t.GuessWANInterface()
+
 	// Clear existing rows (keep header)
 	rowCount := t.interfaceTable.GetRowCount()
 	for i := rowCount - 1; i > 0; i-- {
@@ -222,6 +265,8 @@ func (t *TUI) updateInterfaceTable() {
 	// Add rows - one per interface+direction, with optional IPv6 continuation row
 	row := 1
 	for _, s := range sortedStats {
+		// Check if this is the guessed WAN interface (mark both In and Out for this interface)
+		isWAN := s.ID == wanID && wanPublicCount > 0
 		intIPv4Count := len(s.PrivateIPs)
 		intIPv6Count := len(s.PrivateIPv6s)
 		extIPv4Count := len(s.PublicIPs)
@@ -238,11 +283,16 @@ func (t *TUI) updateInterfaceTable() {
 			subnetV6Color = tcell.ColorYellow
 		}
 
-		// Show marker if selected
+		// Show marker if selected or WAN
 		key := InterfaceKey{ID: s.ID, Direction: s.Direction}
 		marker := ""
+		markerColor := tcell.ColorGreen
 		if t.selectedInterfaces[key] {
 			marker = "*"
+		}
+		if isWAN {
+			marker = "WAN"
+			markerColor = tcell.ColorYellow
 		}
 
 		// Direction display
@@ -251,6 +301,10 @@ func (t *TUI) updateInterfaceTable() {
 		if s.Direction == DirectionOut {
 			dirStr = "Out"
 			dirColor = tcell.ColorOrange
+		}
+		// Mark WAN interface in yellow
+		if isWAN {
+			dirColor = tcell.ColorYellow
 		}
 
 		// IPv4 subnet display (or "-" if none)
@@ -261,7 +315,7 @@ func (t *TUI) updateInterfaceTable() {
 
 		// Row 1: Interface ID + Direction + IPv4 data + flow stats
 		// Columns: *, Interface, Dir, Subnet (guessed), Int, Ext, Flows, Bytes, Packets
-		t.interfaceTable.SetCell(row, 0, tview.NewTableCell(marker).SetTextColor(tcell.ColorGreen).SetExpansion(0))
+		t.interfaceTable.SetCell(row, 0, tview.NewTableCell(marker).SetTextColor(markerColor).SetExpansion(0))
 		t.interfaceTable.SetCell(row, 1, tview.NewTableCell(fmt.Sprintf("%d", s.ID)).SetExpansion(1))
 		t.interfaceTable.SetCell(row, 2, tview.NewTableCell(dirStr).SetTextColor(dirColor).SetExpansion(1))
 		t.interfaceTable.SetCell(row, 3, tview.NewTableCell(subnetV4).SetTextColor(subnetColor).SetExpansion(1))

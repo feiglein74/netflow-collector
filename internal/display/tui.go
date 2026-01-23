@@ -140,19 +140,27 @@ type TUI struct {
 	seenIPv6ByPfx  map[string]map[string]bool // prefix -> set of unique IPs
 }
 
-// NewTUI creates a new interactive TUI
+// NewTUI erstellt eine neue interaktive TUI
 func NewTUI(s *store.FlowStore, refreshRate time.Duration, prefixLen int) *TUI {
+	return NewTUIWithResolver(s, refreshRate, prefixLen, nil)
+}
+
+// NewTUIWithResolver erstellt eine neue interaktive TUI mit externem Resolver
+func NewTUIWithResolver(s *store.FlowStore, refreshRate time.Duration, prefixLen int, res *resolver.Resolver) *TUI {
 	if refreshRate == 0 {
 		refreshRate = 500 * time.Millisecond
 	}
 	if prefixLen <= 0 || prefixLen > 128 {
-		prefixLen = 56 // Default to /56 (common PD size)
+		prefixLen = 56 // Default: /56 (übliche PD-Größe)
+	}
+	if res == nil {
+		res = resolver.New()
 	}
 
 	t := &TUI{
 		app:                tview.NewApplication(),
 		store:              s,
-		resolver:           resolver.New(),
+		resolver:           res,
 		sortField:          store.SortByTime,
 		sortAsc:            false,
 		dnsMode:            DNSModeOff, // Start with DNS off, 'n' cycles through modes
