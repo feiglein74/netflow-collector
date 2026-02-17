@@ -58,6 +58,30 @@ Verbessere die Hostname-Auflösung durch Anbindung an einen Technitium DNS Serve
 
 Die Integration pollt DNS Query Logs und injiziert IP→Hostname Mappings in den Resolver-Cache.
 
+**DNS-Test Tool:**
+
+Zum Testen der Technitium-Verbindung gibt es ein separates Tool:
+
+```bash
+# Build
+go build -o dns-test.exe ./cmd/dns-test
+
+# Ausführen
+./dns-test.exe -server http://192.168.1.1:5380 -token YOUR_API_TOKEN
+```
+
+Das Tool prüft:
+1. API-Verbindung (Session)
+2. Installierte DNS-Apps
+3. Query Logs der letzten 5 Minuten
+
+| Flag | Default | Beschreibung |
+|------|---------|--------------|
+| `-server` | - | Technitium DNS Server URL (required) |
+| `-token` | - | API Token (required) |
+| `-app` | "Query Logs (Sqlite)" | DNS App Name |
+| `-class` | "QueryLogsSqlite.App" | DNS App Class Path |
+
 ### HTTP API & Sankey Visualisierung
 
 Aktiviere die HTTP API für externe Tools:
@@ -214,6 +238,7 @@ service!=dns
 ```
 cmd/
   collector/main.go         Entry Point für Collector
+  dns-test/main.go          Technitium DNS API Test-Tool
   sankey/
     main.go                 Sankey Visualisierungs-Webserver
     static/                 Embedded Frontend (HTML, JS, CSS)
