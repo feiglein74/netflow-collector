@@ -51,7 +51,7 @@ func main() {
 		}
 		os.Exit(1)
 	}
-	fmt.Println("✓ API connection OK\n")
+	fmt.Println("✓ API connection OK")
 
 	// Test 2: List installed apps
 	fmt.Println("=== Test 2: Listing installed DNS Apps ===")

@@ -49,6 +49,26 @@
   - Baseline-Vergleich
   - GeoIP-Integration
 
+## Technische Schulden / Regel-Abweichungen
+
+Gefunden bei Prüfung gegen CLAUDE.md (2026-01-23):
+
+- [x] **`.gitattributes` fehlt** - Behoben (2026-01-23)
+- [x] **Lint-Fehler** - `cmd/dns-test/main.go:54` - Behoben (2026-01-23)
+- [ ] **Code-Kommentare auf Englisch** - Teilweise behoben, noch ausstehend:
+  - [x] `pkg/types/flow.go`
+  - [x] `cmd/collector/main.go`
+  - [x] `cmd/sankey/main.go`
+  - [x] `internal/api/types.go`
+  - [x] `internal/api/server.go`
+  - [ ] `internal/api/handlers.go`
+  - [ ] `internal/store/flowstore.go`
+  - [ ] `internal/display/*.go` (7 Dateien)
+  - [ ] `internal/parser/*.go` (4 Dateien)
+  - [ ] `internal/listener/udp.go`
+  - [ ] `internal/resolver/*.go` (3 Dateien)
+  - [ ] `cmd/dns-test/main.go`
+
 ## Bekannte Einschränkungen
 
 - Variable-Length IPFIX Felder werden noch nicht vollständig unterstützt
@@ -66,3 +86,4 @@
 - [x] Flow Detail-Ansicht
 - [x] Maus-Support
 - [x] != Operator für Filter
+- [x] Sankey Zeitraum-Filter (1m, 5m, 15m, 30m, 1h, 6h, 24h, All)
