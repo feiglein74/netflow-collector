@@ -42,6 +42,55 @@ go build -o netflow-collector.exe ./cmd/collector
 | `-simple` | false | Simple CLI statt interaktiver TUI |
 | `-refresh` | 500ms | Display Refresh Rate |
 | `-max-flows` | 100000 | Maximale Flows im Speicher |
+| `--api-port` | 0 (disabled) | HTTP API Server Port aktivieren |
+| `--dns-server` | - | Technitium DNS Server URL |
+| `--dns-token` | - | Technitium DNS API Token |
+| `--dns-app` | "Query Logs (Sqlite)" | Query Logs App Name |
+| `--dns-poll` | 5s | DNS Polling Interval |
+
+### Technitium DNS Integration
+
+Verbessere die Hostname-Auflösung durch Anbindung an einen Technitium DNS Server:
+
+```bash
+./netflow-collector.exe --dns-server http://192.168.1.1:5380 --dns-token YOUR_API_TOKEN
+```
+
+Die Integration pollt DNS Query Logs und injiziert IP→Hostname Mappings in den Resolver-Cache.
+
+### HTTP API & Sankey Visualisierung
+
+Aktiviere die HTTP API für externe Tools:
+
+```bash
+# Collector mit API auf Port 8080 starten
+./netflow-collector.exe --api-port 8080
+
+# API Endpoints:
+# GET /api/v1/sankey?mode=ip-to-ip&topN=50&filter=proto=tcp&ipVersion=v4
+# GET /api/v1/flows?limit=100&sort=bytes&filter=port:443
+# GET /api/v1/stats
+```
+
+**Sankey Visualisierungs-Tool:**
+
+```bash
+# Build
+go build -o sankey.exe ./cmd/sankey
+
+# Starten (verbindet sich mit Collector API)
+./sankey.exe --collector http://localhost:8080 --port 8081
+
+# Browser öffnen: http://localhost:8081
+```
+
+| Flag | Default | Beschreibung |
+|------|---------|--------------|
+| `--collector` | http://localhost:8080 | NetFlow Collector API URL |
+| `--port` | 8081 | Web UI Port |
+| `--mode` | ip-to-ip | Initial-Modus (ip-to-ip, ip-to-service, firewall) |
+| `--filter` | - | Initial Filter |
+| `--top` | 50 | Initial Top-N Limit |
 
 ## TUI Bedienung
 
@@ -157,12 +206,22 @@ service!=dns
 | `if` | `interface` | In- oder Out-Interface ID |
 | `inif` | `inputif` | Input Interface ID |
 | `outif` | `outputif` | Output Interface ID |
+| `self` | `local` | Self-Traffic (src == dst) |
+| `version` | `ipversion` | IP-Version (4, v4, 6, v6) |
 
 ## Architektur
 
 ```
-cmd/collector/main.go       Entry Point
+cmd/
+  collector/main.go         Entry Point für Collector
+  sankey/
+    main.go                 Sankey Visualisierungs-Webserver
+    static/                 Embedded Frontend (HTML, JS, CSS)
 internal/
+  api/
+    server.go               HTTP API Server mit CORS
+    handlers.go             API Endpoints und Aggregations-Logik
+    types.go                JSON Response Structs
   listener/udp.go           UDP Packet Receiver
   parser/
     parser.go               Version Detection, Template Cache
@@ -175,6 +234,7 @@ internal/
     tui.go                  Interactive TUI (tview) mit F1/F2 Seiten
   resolver/
     resolver.go             DNS Resolution mit Caching
+    technitium.go           Technitium DNS Server Integration
     services.go             Port-zu-Service Mapping
 pkg/types/flow.go           Flow Struct und Helpers
 ```
